@@ -14,6 +14,11 @@ from xfuser.model_executor.models.transformers.transformer_wan_vace import xFuse
 from xfuser.model_executor.pipelines.pipeline_wan_i2v import (
     xFuserWanImageToVideoPipeline,
 )
+from xfuser.model_executor.cache import (
+    DBCachePreset,
+    CacheDitAdapterConfig,
+    DBCacheConfig,
+)
 from xfuser.model_executor.models.runner_models.base_model import (
     ModelSettings,
     xFuserModel,
@@ -188,6 +193,7 @@ class xFuserWan21I2VModel(xFuserModel):
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
+        supported_cache_methods=("dbcache",),
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -213,6 +219,15 @@ class xFuserWan21I2VModel(xFuserModel):
                                  "30.", "31.", "32.", "33.", "34.",
                                  "35.", "36.", "37.", "38.", "39."),
         fsdp_strategy=COMMON_FSDP_STRATEGY,
+        cache_config={
+            "dbcache": DBCacheConfig(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("blocks", "Pattern_2"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
@@ -222,11 +237,9 @@ class xFuserWan21I2VModel(xFuserModel):
         self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
 
     def _load_model(self) -> DiffusionPipeline:
-        transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-            attention_kwargs=_build_attention_kwargs(self.config),
+        transformer = self._build_transformer(
+            xFuserWanTransformer3DWrapper,
+            init_kwargs={"attention_kwargs": _build_attention_kwargs(self.config)},
         )
         te_kwargs, te_quant = self._meta_te_kwargs()
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
@@ -249,7 +262,7 @@ class xFuserWan21I2VModel(xFuserModel):
             num_frames=input_args["num_frames"],
             guidance_scale=input_args["guidance_scale"],
             guidance_scale_2=input_args["guidance_scale_2"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
@@ -295,20 +308,27 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
         }
         self.settings.fp8_gemm_module_list = ["transformer.blocks", "transformer_2.blocks", "text_encoder.encoder.block"]
         self.settings.fp8_precision_overrides = None
+        self.settings.transformer_attr_names = ["transformer", "transformer_2"]
+        # Dual-transformer: t1=high-noise denoiser, t2=low-noise refiner (shorter warmup).
+        self.settings.cache_config = {
+            "dbcache": DBCacheConfig(
+                adapter=[
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer"),
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer_2"),
+                ],
+                preset=[
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
+                ],
+            ),
+        }
 
 
     def _load_model(self) -> DiffusionPipeline:
-        transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-            attention_kwargs=_build_attention_kwargs(self.config),
-        )
-        transformer_2 = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer_2",
-            attention_kwargs=_build_attention_kwargs(self.config),
+        attn_kwargs = {"attention_kwargs": _build_attention_kwargs(self.config)}
+        transformer = self._build_transformer(xFuserWanTransformer3DWrapper, init_kwargs=attn_kwargs)
+        transformer_2 = self._build_transformer(
+            xFuserWanTransformer3DWrapper, subfolder="transformer_2", init_kwargs=attn_kwargs
         )
         te_kwargs, te_quant = self._meta_te_kwargs()
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
@@ -358,6 +378,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         cross_attention_backend=True,
         supports_sparge_attention_backends=True,
         supports_distilled_weights=True,
+        supported_cache_methods=("dbcache",),
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -374,6 +395,19 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         super()._customize_settings(config)
         self.settings.model_name = self._BASE_MODEL
         self.settings.output_name = "wan2.2_distilled_i2v"
+        # 4-step distilled: guidance baked in (guidance_scale=1.0 → no CFG).
+        self.settings.cache_config = {
+            "dbcache": DBCacheConfig(
+                adapter=[
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=False, transformer_attr="transformer"),
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=False, transformer_attr="transformer_2"),
+                ],
+                preset=[
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
+                ],
+            ),
+        }
 
     def _load_model(self) -> DiffusionPipeline:
         transformer = xFuserWanTransformer3DWrapper.from_pretrained(
@@ -392,6 +426,8 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
         )
         _load_distilled_weights(transformer,   self.config.distilled_transformer_path)
         _load_distilled_weights(transformer_2, self.config.distilled_transformer_2_path)
+        # Distilled reloads raw bf16 weights via strict load_state_dict, so streaming
+        # quantize-on-load can't apply here; the _post_load AITER walk quantizes instead.
         pipe = xFuserWanImageToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=self._BASE_MODEL,
             torch_dtype=torch.bfloat16,
@@ -436,7 +472,7 @@ class xFuserWan22DistilledI2VModel(xFuserWan22I2VModel):
             num_frames=input_args["num_frames"],
             guidance_scale=1.0,
             guidance_scale_2=None,
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
@@ -477,6 +513,20 @@ class xFuserWan21T2VModel(xFuserModel):
         flow_shift=12,
         num_hybrid_attn_high_precision_steps = 5,
     )
+    capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        fully_shard_degree=True,
+        use_fp8_gemms=True,
+        use_fp4_gemms=True,
+        use_hybrid_attn_schedule=True,
+        use_parallel_vae=True,
+        cross_attention_backend=True,
+        supports_sparge_attention_backends=True,
+        enable_tiling=True,
+        enable_slicing=True,
+        supported_cache_methods=("dbcache",),
+    )
     settings = ModelSettings(
         mod_value=8,
         fps=16,
@@ -490,6 +540,15 @@ class xFuserWan21T2VModel(xFuserModel):
                                  "30.", "31.", "32.", "33.", "34.",
                                  "35.", "36.", "37.", "38.", "39."),
         fsdp_strategy=COMMON_FSDP_STRATEGY,
+        cache_config={
+            "dbcache": DBCacheConfig(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("blocks", "Pattern_2"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
 
     def _post_load_and_state_initialization(self, input_args: dict) -> None:
@@ -499,11 +558,9 @@ class xFuserWan21T2VModel(xFuserModel):
         self.pipe.scheduler.config.flow_shift = input_args["flow_shift"]
 
     def _load_model(self) -> DiffusionPipeline:
-        transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-            attention_kwargs=_build_attention_kwargs(self.config),
+        transformer = self._build_transformer(
+            xFuserWanTransformer3DWrapper,
+            init_kwargs={"attention_kwargs": _build_attention_kwargs(self.config)},
         )
         from diffusers import WanPipeline
         te_kwargs, te_quant = self._meta_te_kwargs()
@@ -526,7 +583,7 @@ class xFuserWan21T2VModel(xFuserModel):
             num_frames=input_args["num_frames"],
             guidance_scale=input_args["guidance_scale"],
             guidance_scale_2=input_args["guidance_scale_2"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         return DiffusionOutput(videos=output.frames, pipe_args=input_args)
 
@@ -550,19 +607,25 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
         }
         self.settings.fp8_gemm_module_list=["transformer.blocks", "transformer_2.blocks", "text_encoder.encoder.block"]
         self.settings.fp8_precision_overrides=None
+        self.settings.transformer_attr_names = ["transformer", "transformer_2"]
+        self.settings.cache_config = {
+            "dbcache": DBCacheConfig(
+                adapter=[
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer"),
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer_2"),
+                ],
+                preset=[
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
+                    DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
+                ],
+            ),
+        }
 
     def _load_model(self) -> DiffusionPipeline:
-        transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-            attention_kwargs=_build_attention_kwargs(self.config),
-        )
-        transformer_2 = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer_2",
-            attention_kwargs=_build_attention_kwargs(self.config),
+        attn_kwargs = {"attention_kwargs": _build_attention_kwargs(self.config)}
+        transformer = self._build_transformer(xFuserWanTransformer3DWrapper, init_kwargs=attn_kwargs)
+        transformer_2 = self._build_transformer(
+            xFuserWanTransformer3DWrapper, subfolder="transformer_2", init_kwargs=attn_kwargs
         )
         from diffusers import WanPipeline
         te_kwargs, te_quant = self._meta_te_kwargs()
@@ -600,6 +663,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
+        supported_cache_methods=("dbcache",),
     )
     default_input_values = DefaultInputValues(
         height=736,
@@ -625,15 +689,22 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         fp8_precision_override_suffixes=(".net.0.proj", ".net.2"),
         fsdp_strategy=COMMON_FSDP_STRATEGY,
         valid_tasks=["i2v", "t2v"],
+        cache_config={
+            "dbcache": DBCacheConfig(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("blocks", "Pattern_2"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=3, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
 
     def _load_model(self) -> DiffusionPipeline:
         torch.set_float32_matmul_precision('high')
-        transformer = xFuserWanTransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-            attention_kwargs=_build_attention_kwargs(self.config),
+        transformer = self._build_transformer(
+            xFuserWanTransformer3DWrapper,
+            init_kwargs={"attention_kwargs": _build_attention_kwargs(self.config)},
         )
         from diffusers import WanPipeline
         pipe_class = xFuserWanImageToVideoPipeline if self.config.task == "i2v" else WanPipeline
@@ -657,7 +728,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
             "num_frames": input_args["num_frames"],
             "guidance_scale": input_args["guidance_scale"],
             "guidance_scale_2": input_args["guidance_scale_2"],
-            "generator": torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            "generator": self._make_generator(input_args["seed"]),
         }
         if self.config.task == "i2v":
             kwargs["image"] = input_args["image"]
@@ -712,6 +783,7 @@ class xFuserWan21VACEModel(xFuserModel):
         enable_tiling=True,
         enable_slicing=True,
         fully_shard_degree=True,
+        supported_cache_methods=("dbcache",),
     )
 
     default_input_values = DefaultInputValues(
@@ -746,13 +818,19 @@ class xFuserWan21VACEModel(xFuserModel):
         else:
             self.settings.model_name = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
             self.settings.output_name = "wan.2.1_vace_1.3b"
+        # Only cache `blocks`; vace_blocks have a different forward pattern not supported by cache-dit.
+        self.settings.cache_config = {
+            "dbcache": DBCacheConfig(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("blocks", "Pattern_2"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        }
 
     def _load_model(self) -> DiffusionPipeline:
-        transformer = xFuserWanVACETransformer3DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-        )
+        transformer = self._build_transformer(xFuserWanVACETransformer3DWrapper)
         from diffusers import WanVACEPipeline
         te_kwargs, te_quant = self._meta_te_kwargs()
         pipe = WanVACEPipeline.from_pretrained(
@@ -799,7 +877,7 @@ class xFuserWan21VACEModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             num_frames=input_args["num_frames"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
             video=input_args["video"],
             mask=input_args["mask"],
         )
