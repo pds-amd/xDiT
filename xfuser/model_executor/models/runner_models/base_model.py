@@ -1,4 +1,5 @@
 import abc
+import os
 import torch
 import copy
 import argparse
@@ -940,6 +941,72 @@ class xFuserModel(abc.ABC):
         if self.config.use_vae_channels_last_format:
             self._convert_vae_to_channels_last()
 
+        if os.environ.get("XDIT_VERIFY_FILL"):
+            self._verify_weights_across_ranks()
+
+    def _verify_weights_across_ranks(self) -> None:
+        """Diagnostic (env XDIT_VERIFY_FILL=1): prove every pipe component's params/buffers match
+        world-rank0 by NAME after load + quant. rank0 pickles {name: (shape, dtype, sum, sumsq, nan)}
+        and broadcasts it; peers compare and log MISSING / SHAPE-DTYPE / CONTENT / NAN, or CLEAN. A
+        clean pass means a black image is a forward-time bug, not a weight/load bug. Inert unless the
+        env var is set. Temporary diagnostic."""
+        import torch
+        world = get_world_group()
+        if world.world_size <= 1:
+            return
+
+        def _reduce(t):
+            try:
+                f = t.detach().to(torch.float64)
+                return (tuple(t.shape), str(t.dtype), round(float(f.sum().item()), 3),
+                        round(float((f * f).sum().item()), 3),
+                        bool(torch.isnan(f).any() or torch.isinf(f).any()))
+            except Exception as e:  # fp8 / exotic dtype: byte-checksum so content divergence is caught
+                try:
+                    b = t.detach().contiguous().view(torch.uint8).to(torch.int64)
+                    return (tuple(t.shape), str(t.dtype), int(b.sum().item()),
+                            int((b * b).sum().item()), False)
+                except Exception as e2:
+                    return (tuple(t.shape), str(t.dtype), "unhashable", repr(e2)[:40], False)
+
+        seen = set()
+        candidates = list(self.settings.fsdp_strategy) + [
+            "transformer", "text_encoder", "text_encoder_2", "text_encoder_3", "vae",
+        ]
+        for cname in candidates:
+            if cname in seen:
+                continue
+            seen.add(cname)
+            comp = getattr(self.pipe, cname, None)
+            if comp is None or not hasattr(comp, "named_parameters"):
+                continue
+            local = {}
+            for n, t in comp.named_parameters(recurse=True, remove_duplicate=False):
+                local[n] = _reduce(t)
+            for n, t in comp.named_buffers(recurse=True, remove_duplicate=False):
+                local[n] = _reduce(t)
+            box = [local if world.rank_in_group == 0 else None]
+            world.broadcast_object_list(box, src=0)
+            ref = box[0]
+            if world.rank_in_group == 0:
+                nans = [n for n, v in local.items() if v[-1]]
+                log(f"[VERIFY_WEIGHTS] {cname} rank0: {len(local)} tensors, {len(nans)} NaN/Inf"
+                    + (": " + ", ".join(nans[:8]) if nans else ""))
+                continue
+            problems = []
+            for n, rv in ref.items():
+                lv = local.get(n)
+                if lv is None:
+                    problems.append(f"MISSING {n}")
+                elif lv[:2] != rv[:2]:
+                    problems.append(f"SHAPE/DTYPE {n} peer={lv[:2]} r0={rv[:2]}")
+                elif lv[2:4] != rv[2:4]:
+                    problems.append(f"CONTENT {n} peer={lv[2:4]} r0={rv[2:4]}")
+                elif lv[-1]:
+                    problems.append(f"NAN {n}")
+            log(f"[VERIFY_WEIGHTS] {cname} rank{world.rank_in_group}: {len(ref)} ref, "
+                f"{len(problems)} problems"
+                + (": " + " | ".join(problems[:12]) if problems else " -> CLEAN"))
 
     def _shard_model_with_fsdp(self) -> None:
         """ Shard the model with FSDP based on settings """
