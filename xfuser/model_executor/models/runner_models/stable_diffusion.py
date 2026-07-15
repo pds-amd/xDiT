@@ -43,7 +43,7 @@ class xFuserStableDiffusionModel(xFuserModel):
                 "wrap_attrs": ["encoder.block"],
             },
         },
-        fp8_gemm_module_list=["transformer.transformer_blocks", "text_encoder_3.encoder.block"],
+        fp8_gemm_module_list=["transformer.transformer_blocks"],
     )
 
     def _load_model(self) -> DiffusionPipeline:
