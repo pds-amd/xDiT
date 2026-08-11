@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import re
 import torch
 from typing import List, Optional
@@ -296,6 +297,14 @@ class xFuserWan21I2VModel(xFuserModel):
 @register_model("Wan2.2-I2V")
 class xFuserWan22I2VModel(xFuserWan21I2VModel):
 
+    # WAN has no in-tree FBCache adapter (that path is FLUX.2-specific). FBCache is a
+    # special case of DBCache (first-block cache), so expose "fbcache" as DBCache with
+    # Fn_compute_blocks=1; base_model routes it through the cache-dit (dbcache) engine.
+    capabilities = dataclasses.replace(
+        xFuserWan21I2VModel.capabilities,
+        supported_cache_methods=("dbcache", "fbcache"),
+    )
+
     def _customize_settings(self, config: xFuserArgs) -> None:
         super()._customize_settings(config)
         self.settings.model_name = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
@@ -317,6 +326,17 @@ class xFuserWan22I2VModel(xFuserWan21I2VModel):
                 preset=[
                     DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
                     DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
+                ],
+            ),
+            # FBCache alias: DBCache first-block (Fn_compute_blocks=1) on both experts.
+            "fbcache": DBCacheConfig(
+                adapter=[
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer"),
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer_2"),
+                ],
+                preset=[
+                    DBCachePreset(Fn_compute_blocks=1, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
+                    DBCachePreset(Fn_compute_blocks=1, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
                 ],
             ),
         }
@@ -595,6 +615,12 @@ class xFuserWan21T2VModel(xFuserModel):
 @register_model("Wan2.2-T2V")
 class xFuserWan22T2VModel(xFuserWan21T2VModel):
 
+    # See xFuserWan22I2VModel: "fbcache" == DBCache first-block (Fn_compute_blocks=1).
+    capabilities = dataclasses.replace(
+        xFuserWan21T2VModel.capabilities,
+        supported_cache_methods=("dbcache", "fbcache"),
+    )
+
     def _customize_settings(self, config: xFuserArgs) -> None:
         super()._customize_settings(config)
         self.settings.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -615,6 +641,17 @@ class xFuserWan22T2VModel(xFuserWan21T2VModel):
                 preset=[
                     DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
                     DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
+                ],
+            ),
+            # FBCache alias: DBCache first-block (Fn_compute_blocks=1) on both experts.
+            "fbcache": DBCacheConfig(
+                adapter=[
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer"),
+                    CacheDitAdapterConfig(blocks=(("blocks", "Pattern_2"),), enable_separate_cfg=True, transformer_attr="transformer_2"),
+                ],
+                preset=[
+                    DBCachePreset(Fn_compute_blocks=1, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=4),
+                    DBCachePreset(Fn_compute_blocks=1, residual_diff_threshold=0.12, scm_policy="ultra", max_warmup_steps=2),
                 ],
             ),
         }
@@ -664,7 +701,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         supports_sparge_attention_backends=True,
         enable_tiling=True,
         enable_slicing=True,
-        supported_cache_methods=("dbcache",),
+        supported_cache_methods=("dbcache", "fbcache"),
     )
     default_input_values = DefaultInputValues(
         height=736,
@@ -697,6 +734,14 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
                     enable_separate_cfg=True,
                 ),
                 preset=DBCachePreset(Fn_compute_blocks=3, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+            # FBCache alias: DBCache first-block (Fn_compute_blocks=1).
+            "fbcache": DBCacheConfig(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("blocks", "Pattern_2"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=1, residual_diff_threshold=0.12, scm_policy="ultra"),
             ),
         },
     )
