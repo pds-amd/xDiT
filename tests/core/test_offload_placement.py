@@ -45,6 +45,8 @@ def _model(*, local_rank, monkeypatch, **offload_flags):
     model = SimpleNamespace(
         config=SimpleNamespace(**flags),
         pipe=pipe,
+        _vae_manager=SimpleNamespace(enable_options=lambda vaes: None),
+        _decoding_vaes=lambda: [],
         _get_compiled_pipe_components=lambda: [],
     )
     model._local_onload_device = lambda: xFuserModel._local_onload_device(model)

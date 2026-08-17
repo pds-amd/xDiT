@@ -66,6 +66,37 @@ def setup_distributed():
 
 
 @pytest.fixture
+def simple_transformer_model():
+    """Create a simple transformer model with blocks."""
+    class SimpleBlock(nn.Module):
+        def __init__(self, dim=256):
+            super().__init__()
+            self.linear1 = nn.Linear(dim, dim)
+            self.linear2 = nn.Linear(dim, dim)
+            self.norm = nn.LayerNorm(dim)
+
+        def forward(self, x):
+            x = self.linear1(x)
+            x = self.linear2(x)
+            return self.norm(x)
+
+    class SimpleTransformer(nn.Module):
+        def __init__(self, num_blocks=3, dim=256):
+            super().__init__()
+            self.blocks = nn.ModuleList(
+                [SimpleBlock(dim) for _ in range(num_blocks)]
+            )
+            self.final_norm = nn.LayerNorm(dim)
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = block(x)
+            return self.final_norm(x)
+
+    return SimpleTransformer(num_blocks=3, dim=256)
+
+
+@pytest.fixture
 def dit_model():
     """Create a mock DiT model."""
     class DiTBlock(nn.Module):
