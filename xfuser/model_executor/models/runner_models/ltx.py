@@ -17,6 +17,11 @@ from xfuser.core.utils.runner_utils import (
     log,
 )
 from xfuser.core.utils.video_utils import encode_video_with_audio
+from xfuser.model_executor.cache import (
+    DBCachePreset,
+    CacheDitAdapterConfig,
+    DBCacheSettings,
+)
 
 DEFAULT_NEGATIVE_PROMPT = "" \
 "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, " \
@@ -65,6 +70,15 @@ class xFuserLTX23VideoModel(xFuserModel):
                 "dtype": torch.bfloat16,
             },
         },
+        step_cache_config={
+            "dbcache": DBCacheSettings(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("transformer_blocks", "Pattern_0"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
 
     capabilities = ModelCapabilities(
@@ -74,6 +88,7 @@ class xFuserLTX23VideoModel(xFuserModel):
         enable_slicing=True,
         use_parallel_vae=True,
         fully_shard_degree=True,
+        supports_step_caching=True,
     )
 
     _STG_SCALE = 1.0
@@ -267,6 +282,15 @@ class xFuserLTX2VideoModel(xFuserModel):
                 "dtype": torch.bfloat16,
             },
         },
+        step_cache_config={
+            "dbcache": DBCacheSettings(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("transformer_blocks", "Pattern_0"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
@@ -276,6 +300,7 @@ class xFuserLTX2VideoModel(xFuserModel):
         use_fp8_gemms=True,
         use_parallel_vae=True,
         fully_shard_degree=True,
+        supports_step_caching=True,
     )
 
     def _load_model(self) -> DiffusionPipeline:

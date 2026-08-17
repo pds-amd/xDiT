@@ -1,6 +1,11 @@
 import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from xfuser import xFuserStableDiffusion3Pipeline
+from xfuser.model_executor.cache import (
+    DBCachePreset,
+    CacheDitAdapterConfig,
+    DBCacheSettings,
+)
 from xfuser.model_executor.models.runner_models.base_model import (
     xFuserModel,
     register_model,
@@ -37,6 +42,7 @@ class xFuserStableDiffusionModel(xFuserModel):
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_parallel_vae=True,
+        supports_step_caching=True,
     )
     default_input_values = DefaultInputValues(
         height=1024,
@@ -58,6 +64,14 @@ class xFuserStableDiffusionModel(xFuserModel):
         },
         fp8_gemm_module_list=["transformer.transformer_blocks"],
         fp8_text_encoder_module_list=["text_encoder_3.encoder.block"],
+        step_cache_config={
+            "dbcache": DBCacheSettings(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("transformer_blocks", "Pattern_1"),),
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.08, scm_policy="fast", enable_encoder_calibrator=False),
+            ),
+        },
     )
 
     def _load_model(self) -> DiffusionPipeline:

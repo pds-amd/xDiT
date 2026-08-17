@@ -25,6 +25,11 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadDeclaration,
     LoaderAdapter,
 )
+from xfuser.model_executor.cache import (
+    DBCachePreset,
+    CacheDitAdapterConfig,
+    DBCacheSettings,
+)
 
 @register_model("tencent/HunyuanVideo")
 @register_model("HunyuanVideo")
@@ -44,6 +49,7 @@ class xFuserHunyuanvideoModel(xFuserModel):
         use_fp8_gemms=True,
         use_parallel_vae=True,
         fully_shard_degree=True,
+        supports_step_caching=True,
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -78,6 +84,16 @@ class xFuserHunyuanvideoModel(xFuserModel):
                 # compete with the sharded transformer during encode_prompt.
                 "offload_policy": "cpu",
             },
+        },
+        # guidance embedded into timestep conditioning (1 forward pass per step, no separate cfg).
+        step_cache_config={
+            "dbcache": DBCacheSettings(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("transformer_blocks", "Pattern_0"), ("single_transformer_blocks", "Pattern_0")),
+                    enable_separate_cfg=False,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=4, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
         },
     )
 
@@ -177,6 +193,7 @@ class xFuserHunyuanvideo15Model(xFuserModel):
         use_fp8_gemms=True,
         use_parallel_vae=True,
         use_parallel_vae_encoder=True,
+        supports_step_caching=True,
     )
     default_input_values = DefaultInputValues(
         height=720,
@@ -191,6 +208,15 @@ class xFuserHunyuanvideo15Model(xFuserModel):
         fp8_gemm_module_list=["transformer.transformer_blocks"],
         mod_value=16,
         valid_tasks=["i2v", "t2v"],
+        step_cache_config={
+            "dbcache": DBCacheSettings(
+                adapter=CacheDitAdapterConfig(
+                    blocks=(("transformer_blocks", "Pattern_0"),),
+                    enable_separate_cfg=True,
+                ),
+                preset=DBCachePreset(Fn_compute_blocks=5, residual_diff_threshold=0.12, scm_policy="ultra"),
+            ),
+        },
     )
 
 
