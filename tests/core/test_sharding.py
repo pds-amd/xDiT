@@ -5,8 +5,8 @@ These tests verify the FSDP sharding functionality for transformer models
 using pytest conventions. Tests run on CPU with gloo backend for CI compatibility.
 
 Run with:
-    pytest tests/test_sharding.py -v
-    pytest tests/test_sharding.py::test_shard_component_basic -v  # Single test
+    pytest tests/core/test_sharding.py -v
+    pytest tests/core/test_sharding.py::test_shard_component_basic -v  # Single test
 """
 import pytest
 import torch
@@ -30,52 +30,39 @@ from xfuser.core.distributed.sharding import (
 # Test Fixtures
 # ============================================================================
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def setup_distributed():
-    """Initialize distributed environment once for all tests."""
-    if not dist.is_initialized():
+    """A gloo group for this module's tests, taken down again with the environment it needed.
+
+    Scoped to the module and unwound rather than left up for the session: the rendezvous
+    variables are read by any process started later, so a test that spawns workers of its
+    own inherits RANK=0 and WORLD_SIZE=1 from here and hangs waiting for a rendezvous that
+    has already happened. test_multirank_load_and_sharding does exactly that.
+    """
+    started = not dist.is_initialized()
+    previous = {
+        name: os.environ.get(name)
+        for name in ('MASTER_ADDR', 'MASTER_PORT', 'RANK', 'WORLD_SIZE')
+    }
+    if started:
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '29501'
         os.environ['RANK'] = '0'
         os.environ['WORLD_SIZE'] = '1'
-        
+
         # Use gloo backend for CPU testing (nccl requires GPU)
         dist.init_process_group(backend='gloo', init_method='env://')
-    
+
     yield
-    
-    # Cleanup after all tests
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
-
-@pytest.fixture
-def simple_transformer_model():
-    """Create a simple transformer model with blocks."""
-    class SimpleBlock(nn.Module):
-        def __init__(self, dim=256):
-            super().__init__()
-            self.linear1 = nn.Linear(dim, dim)
-            self.linear2 = nn.Linear(dim, dim)
-            self.norm = nn.LayerNorm(dim)
-        
-        def forward(self, x):
-            x = self.linear1(x)
-            x = self.linear2(x)
-            return self.norm(x)
-    
-    class SimpleTransformer(nn.Module):
-        def __init__(self, num_blocks=3, dim=256):
-            super().__init__()
-            self.blocks = nn.ModuleList([SimpleBlock(dim) for _ in range(num_blocks)])
-            self.final_norm = nn.LayerNorm(dim)
-        
-        def forward(self, x):
-            for block in self.blocks:
-                x = block(x)
-            return self.final_norm(x)
-    
-    return SimpleTransformer(num_blocks=3, dim=256)
+    if started:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @pytest.fixture

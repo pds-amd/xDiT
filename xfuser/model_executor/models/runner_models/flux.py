@@ -16,10 +16,12 @@ from xfuser.core.utils.runner_utils import (
 )
 from xfuser.core.distributed import get_runtime_state, get_pipeline_parallel_world_size
 from xfuser import xFuserFluxPipeline
+from xfuser.model_executor.models.runner_models.loading.contracts import LoadDeclaration
 
 
 @register_model("black-forest-labs/FLUX.1-dev")
 @register_model("FLUX.1-dev")
+@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFluxModel(xFuserModel):
 
     min_diffusers_version = "0.35.2"
@@ -49,6 +51,9 @@ class xFuserFluxModel(xFuserModel):
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
         ],
+        fp8_text_encoder_module_list=[
+            "text_encoder_2.encoder.block",
+        ],
         fsdp_strategy={
             "transformer": {
                 "wrap_attrs": ["transformer_blocks", "single_transformer_blocks"],
@@ -76,15 +81,15 @@ class xFuserFluxModel(xFuserModel):
             from xfuser.model_executor.models.transformers.transformer_flux import (
                 xFuserFlux1Transformer2DWrapper,
             )
-            transformer = xFuserFlux1Transformer2DWrapper.from_pretrained(
-                pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=torch.bfloat16,
-                subfolder="transformer",
-            )
+
+            transformer = self._build_transformer(xFuserFlux1Transformer2DWrapper)
+            te_kwargs, te_quant = self._meta_te_kwargs()
             pipe = FluxPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
                 transformer=transformer,
+                quantization_config=te_quant,
+                **te_kwargs,
             )
 
         return pipe
@@ -104,7 +109,7 @@ class xFuserFluxModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         images = output.images if output else []  # For legacy pipelines
         return DiffusionOutput(images=images, pipe_args=input_args)
@@ -112,6 +117,7 @@ class xFuserFluxModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.1-Kontext-dev")
 @register_model("FLUX.1-Kontext-dev")
+@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFluxKontextModel(xFuserModel):
 
     min_diffusers_version = "0.35.2"
@@ -142,6 +148,9 @@ class xFuserFluxKontextModel(xFuserModel):
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
         ],
+        fp8_text_encoder_module_list=[
+            "text_encoder_2.encoder.block",
+        ],
         fsdp_strategy={
             "transformer": {
                 "wrap_attrs": ["transformer_blocks", "single_transformer_blocks"],
@@ -157,15 +166,15 @@ class xFuserFluxKontextModel(xFuserModel):
         from xfuser.model_executor.models.transformers.transformer_flux import (
             xFuserFlux1Transformer2DWrapper,
         )
-        transformer = xFuserFlux1Transformer2DWrapper.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            subfolder="transformer",
-        )
+
+        transformer = self._build_transformer(xFuserFlux1Transformer2DWrapper)
+        te_kwargs, te_quant = self._meta_te_kwargs()
         pipe = FluxKontextPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
             transformer=transformer,
+            quantization_config=te_quant,
+            **te_kwargs,
         )
         return pipe
 
@@ -186,7 +195,7 @@ class xFuserFluxKontextModel(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         images = output.images if output else []  # non-last pp ranks return None
         return DiffusionOutput(images=images, pipe_args=input_args)
@@ -219,6 +228,7 @@ class xFuserFluxKontextModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-dev")
 @register_model("FLUX.2-dev")
+@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Model(xFuserModel):
 
     # Flux2Pipeline and the transformer symbols the wrapper needs all landed in 0.36.
@@ -254,6 +264,9 @@ class xFuserFlux2Model(xFuserModel):
         fp8_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
+        ],
+        fp8_text_encoder_module_list=[
+            "text_encoder.model.language_model.layers",
         ],
         fp4_gemm_module_list=[
             "transformer.transformer_blocks",
@@ -323,15 +336,15 @@ class xFuserFlux2Model(xFuserModel):
                 xFuserFlux2Transformer2DWrapper,
             )
             from diffusers import Flux2Pipeline
-            transformer = xFuserFlux2Transformer2DWrapper.from_pretrained(
-                pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=torch.bfloat16,
-                subfolder="transformer",
-            )
+
+            transformer = self._build_transformer(xFuserFlux2Transformer2DWrapper)
+            te_kwargs, te_quant = self._meta_te_kwargs()
             pipe = Flux2Pipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
                 transformer=transformer,
+                quantization_config=te_quant,
+                **te_kwargs,
             )
         return pipe
 
@@ -363,7 +376,7 @@ class xFuserFlux2Model(xFuserModel):
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
             max_sequence_length=input_args["max_sequence_length"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         images = output.images if output else []  # non-last pp ranks return None
         return DiffusionOutput(images=images, pipe_args=input_args)
@@ -371,6 +384,7 @@ class xFuserFlux2Model(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-klein-9B")
 @register_model("FLUX.2-klein-9B")
+@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Klein9BModel(xFuserModel):
 
     # Flux2KleinPipeline landed in 0.37, one release after Flux2Pipeline.
@@ -402,6 +416,9 @@ class xFuserFlux2Klein9BModel(xFuserModel):
         fp8_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
+        ],
+        fp8_text_encoder_module_list=[
+            "text_encoder.model.layers",
         ],
         fsdp_strategy={
             "transformer": {
@@ -439,15 +456,15 @@ class xFuserFlux2Klein9BModel(xFuserModel):
                 xFuserFlux2Transformer2DWrapper,
             )
             from diffusers import Flux2KleinPipeline
-            transformer = xFuserFlux2Transformer2DWrapper.from_pretrained(
-                pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=torch.bfloat16,
-                subfolder="transformer",
-            )
+
+            transformer = self._build_transformer(xFuserFlux2Transformer2DWrapper)
+            te_kwargs, te_quant = self._meta_te_kwargs()
             pipe = Flux2KleinPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
                 transformer=transformer,
+                quantization_config=te_quant,
+                **te_kwargs,
             )
         return pipe
 
@@ -459,7 +476,7 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             image=input_args["images"],
             num_inference_steps=input_args["num_inference_steps"],
             guidance_scale=input_args["guidance_scale"],
-            generator=torch.Generator(device="cuda").manual_seed(input_args["seed"]),
+            generator=self._make_generator(input_args["seed"]),
         )
         images = output.images if output else []  # non-last pp ranks return None
         return DiffusionOutput(images=images, pipe_args=input_args)
@@ -486,6 +503,7 @@ class xFuserFlux2Klein9BModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-klein-4B")
 @register_model("FLUX.2-klein-4B")
+@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Klein4BModel(xFuserFlux2Klein9BModel):
 
     settings = ModelSettings(
@@ -495,6 +513,9 @@ class xFuserFlux2Klein4BModel(xFuserFlux2Klein9BModel):
         fp8_gemm_module_list=[
             "transformer.transformer_blocks",
             "transformer.single_transformer_blocks",
+        ],
+        fp8_text_encoder_module_list=[
+            "text_encoder.model.layers",
         ],
         fsdp_strategy={
             "transformer": {

@@ -18,6 +18,7 @@ from xfuser.model_executor.models.runner_models.base_model import (
     DefaultInputValues,
     DiffusionOutput,
 )
+from xfuser.model_executor.models.runner_models.loading.contracts import LoadDeclaration
 from xfuser.core.utils.runner_utils import log
 
 
@@ -74,6 +75,14 @@ def _load_json_prompt(prompt: str) -> str:
 
 @register_model("robbyant/lingbot-video-moe-30b-a3b")
 @register_model("LingBot-Video-MoE")
+@LoadDeclaration.declare(
+    unsupported_reason=(
+        "the pipeline is composed from separately loaded components in _build_pipe "
+        "rather than through a config-only transformer seam, and the runner shards "
+        "with LingBot's own per-block FSDP wrapping that ignores minority-dtype "
+        "fp32 norm and router parameters instead of xDiT's sharding path"
+    )
+)
 class xFuserLingBotVideoMoEModel(xFuserModel):
 
     def save_output(self, output):
@@ -445,6 +454,13 @@ class xFuserLingBotVideoMoEModel(xFuserModel):
 
 @register_model("robbyant/lingbot-video-dense-1.3b")
 @register_model("LingBot-Video-Dense")
+@LoadDeclaration.declare(
+    unsupported_reason=(
+        "shares the MoE runner's composed _build_pipe construction and its own "
+        "per-block FSDP wrapping, so the same config-only collective load remains "
+        "unverified for the dense checkpoint"
+    )
+)
 class xFuserLingBotVideoDenseModel(xFuserLingBotVideoMoEModel):
     settings = ModelSettings(
         model_name="robbyant/lingbot-video-dense-1.3b",
