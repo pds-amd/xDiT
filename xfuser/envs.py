@@ -313,12 +313,14 @@ class PackagesEnvChecker:
         sys.modules["flash_attn_3.flash_attn_interface"] = _fai
 
     def check_transformer_engine(self):
-        import sys
         if not torch.cuda.is_available() or _is_hip():
             return False
+        # The FA3 shim is best-effort. On Blackwell (SM100) with NGC PyTorch the FA3
+        # ``flash_attn_interface`` module is absent, but TE's FP8 DotProductAttention
+        # runs on the cuDNN fused-attention backend without it, so do not hard-require
+        # it here -- gating on the shim would silently disable the NVTE_FP8 attention
+        # backend on B200 even though attention_backend.py fully supports it.
         self._install_flash_attn_3_shim_for_transformer_engine()
-        if "flash_attn_3.flash_attn_interface" not in sys.modules:
-            return False
         try:
             from transformer_engine.pytorch import DotProductAttention, fp8_autocast  # noqa: F401
             from transformer_engine.common import recipe # noqa: F401
