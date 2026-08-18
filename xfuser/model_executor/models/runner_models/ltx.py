@@ -11,7 +11,10 @@ from xfuser.model_executor.models.runner_models.base_model import (
     ModelSettings,
     ModelCapabilities,
 )
-from xfuser.model_executor.models.runner_models.loading.contracts import LoadDeclaration
+from xfuser.model_executor.models.runner_models.loading.contracts import (
+    LoadSupport,
+    LoadRoute,
+)
 
 from xfuser.core.utils.runner_utils import (
     log,
@@ -38,15 +41,7 @@ DEFAULT_NEGATIVE_PROMPT = "" \
 
 @register_model("dg845/LTX-2.3-Diffusers")
 @register_model("LTX-2.3")
-@LoadDeclaration.declare(
-    unsupported_reason=(
-        "stage 2 distilled LoRA is applied before a meta transformer would "
-        "receive its base checkpoint; collective meta loading is withheld "
-        "until that load order is reordered and verified"
-    )
-)
 class xFuserLTX23VideoModel(xFuserModel):
-
     min_diffusers_version = "0.37.0"
 
     default_input_values = DefaultInputValues(
@@ -81,6 +76,13 @@ class xFuserLTX23VideoModel(xFuserModel):
         },
     )
 
+    # Stage-2 LoRA is applied before a meta transformer could receive base weights.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
@@ -107,7 +109,7 @@ class xFuserLTX23VideoModel(xFuserModel):
             xFuserLTX2VideoTransformer3DWrapper,
         )
 
-        transformer = self._build_transformer(
+        transformer = self.loader.load_transformer(
             xFuserLTX2VideoTransformer3DWrapper
         )
 
@@ -250,15 +252,7 @@ class xFuserLTX23VideoModel(xFuserModel):
         self.second_pipe.to(self.pipe.device)
 @register_model("Lightricks/LTX-2")
 @register_model("LTX-2")
-@LoadDeclaration.declare(
-    unsupported_reason=(
-        "stage 2 distilled LoRA is applied before a meta transformer would "
-        "receive its base checkpoint; collective meta loading is withheld "
-        "until that load order is reordered and verified"
-    )
-)
 class xFuserLTX2VideoModel(xFuserModel):
-
     min_diffusers_version = "0.37.0"
 
     default_input_values = DefaultInputValues(
@@ -292,6 +286,13 @@ class xFuserLTX2VideoModel(xFuserModel):
             ),
         },
     )
+    # Stage-2 LoRA is applied before a meta transformer could receive base weights.
+    load_support = LoadSupport(
+        meta_transformers=(),
+        meta_text_encoders=(),
+        replicated_meta=False,
+        routes=LoadRoute.NONE,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
@@ -310,7 +311,7 @@ class xFuserLTX2VideoModel(xFuserModel):
             xFuserLTX2VideoTransformer3DWrapper,
         )
 
-        transformer = self._build_transformer(
+        transformer = self.loader.load_transformer(
             xFuserLTX2VideoTransformer3DWrapper
         )
         pipe = LTX2Pipeline.from_pretrained(

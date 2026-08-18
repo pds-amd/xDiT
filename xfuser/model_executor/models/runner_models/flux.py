@@ -21,21 +21,29 @@ from xfuser.core.utils.runner_utils import (
 )
 from xfuser.core.distributed import get_runtime_state, get_pipeline_parallel_world_size
 from xfuser import xFuserFluxPipeline
-from xfuser.model_executor.models.runner_models.loading.contracts import LoadDeclaration
+from xfuser.model_executor.models.runner_models.loading.contracts import (
+    LoadSupport,
+    STANDARD_LOAD_ROUTES,
+)
 
 
 @register_model("black-forest-labs/FLUX.1-dev")
 @register_model("FLUX.1-dev")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFluxModel(xFuserModel):
-
     min_diffusers_version = "0.35.2"
 
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder_2',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
         pipefusion_parallel_degree=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         use_parallel_vae=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -97,8 +105,8 @@ class xFuserFluxModel(xFuserModel):
                 xFuserFlux1Transformer2DWrapper,
             )
 
-            transformer = self._build_transformer(xFuserFlux1Transformer2DWrapper)
-            te_kwargs, te_quant = self._meta_te_kwargs()
+            transformer = self.loader.load_transformer(xFuserFlux1Transformer2DWrapper)
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
             pipe = FluxPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
@@ -132,15 +140,20 @@ class xFuserFluxModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.1-Kontext-dev")
 @register_model("FLUX.1-Kontext-dev")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFluxKontextModel(xFuserModel):
-
     min_diffusers_version = "0.35.2"
 
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder_2',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         enable_tiling=True,
         enable_slicing=True,
         use_parallel_vae=True,
@@ -190,8 +203,8 @@ class xFuserFluxKontextModel(xFuserModel):
             xFuserFlux1Transformer2DWrapper,
         )
 
-        transformer = self._build_transformer(xFuserFlux1Transformer2DWrapper)
-        te_kwargs, te_quant = self._meta_te_kwargs()
+        transformer = self.loader.load_transformer(xFuserFlux1Transformer2DWrapper)
+        te_kwargs, te_quant = self.loader.plan_text_encoders()
         pipe = FluxKontextPipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             torch_dtype=torch.bfloat16,
@@ -251,18 +264,23 @@ class xFuserFluxKontextModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-dev")
 @register_model("FLUX.2-dev")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Model(xFuserModel):
-
     # Flux2Pipeline and the transformer symbols the wrapper needs all landed in 0.36.
     # PipeFusion additionally needs 0.37, because xfuser's FLUX.2 pipeline module also
     # binds Flux2KleinPipeline.
     min_diffusers_version = "0.36.0"
 
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         use_fp4_gemms=True,
         fully_shard_degree=True,
         enable_tiling=True,
@@ -345,8 +363,8 @@ class xFuserFlux2Model(xFuserModel):
             )
             from diffusers import Flux2Pipeline
 
-            transformer = self._build_transformer(xFuserFlux2Transformer2DWrapper)
-            te_kwargs, te_quant = self._meta_te_kwargs()
+            transformer = self.loader.load_transformer(xFuserFlux2Transformer2DWrapper)
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
             pipe = Flux2Pipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
@@ -392,16 +410,21 @@ class xFuserFlux2Model(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-klein-9B")
 @register_model("FLUX.2-klein-9B")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Klein9BModel(xFuserModel):
-
     # Flux2KleinPipeline landed in 0.37, one release after Flux2Pipeline.
     min_diffusers_version = "0.37.0"
 
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         enable_tiling=True,
         enable_slicing=True,
         use_parallel_vae=True,
@@ -466,8 +489,8 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             )
             from diffusers import Flux2KleinPipeline
 
-            transformer = self._build_transformer(xFuserFlux2Transformer2DWrapper)
-            te_kwargs, te_quant = self._meta_te_kwargs()
+            transformer = self.loader.load_transformer(xFuserFlux2Transformer2DWrapper)
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
             pipe = Flux2KleinPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
                 torch_dtype=torch.bfloat16,
@@ -512,8 +535,13 @@ class xFuserFlux2Klein9BModel(xFuserModel):
 
 @register_model("black-forest-labs/FLUX.2-klein-4B")
 @register_model("FLUX.2-klein-4B")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserFlux2Klein4BModel(xFuserFlux2Klein9BModel):
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
 
     settings = ModelSettings(
         model_name="black-forest-labs/FLUX.2-klein-4B",

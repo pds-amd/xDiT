@@ -80,16 +80,11 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
                 cache_method=None,
                 create_config=lambda: (object(), None),
             )
-            self.fp8_backend = None
-            self.format_backend = None
-            self.backends = SimpleNamespace(uses_blockwise_fp8=lambda: False)
+            self.loader = mock.Mock()
             self._vae_manager = mock.Mock()
             self._vae_manager.decoding_vaes.side_effect = (
                 lambda pipes: [pipe.vae for pipe in pipes]
             )
-
-        def _select_preload_contract(self, *, world_size):
-            return object()
 
         def _load_model_checked(self):
             return Pipe(first)

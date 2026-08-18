@@ -13,7 +13,10 @@ from xfuser.model_executor.models.runner_models.base_model import (
     ModelCapabilities,
     ModelSettings,
 )
-from xfuser.model_executor.models.runner_models.loading.contracts import LoadDeclaration
+from xfuser.model_executor.models.runner_models.loading.contracts import (
+    LoadSupport,
+    STANDARD_LOAD_ROUTES,
+)
 
 
 def _normalize_prompt(prompt_input):
@@ -48,9 +51,7 @@ def _set_effective_heads_for_ulysses(transformer, ulysses_degree: int) -> None:
 
 @register_model("Tongyi-MAI/Z-Image")
 @register_model("Z-Image")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserZImageModel(xFuserModel):
-
     min_diffusers_version = "0.36.0"
 
     default_input_values = DefaultInputValues(
@@ -59,12 +60,19 @@ class xFuserZImageModel(xFuserModel):
         num_inference_steps=50,
         guidance_scale=4.0,
     )
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         use_cfg_parallel=True,
         enable_tiling=True,
         enable_slicing=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         use_int8_gemms=True,
         use_parallel_vae=True,
         supports_step_caching=True,
@@ -119,9 +127,9 @@ class xFuserZImageModel(xFuserModel):
             xFuserZImageTransformer2DWrapper,
         )
 
-        transformer = self._build_transformer(xFuserZImageTransformer2DWrapper)
+        transformer = self.loader.load_transformer(xFuserZImageTransformer2DWrapper)
         _set_effective_heads_for_ulysses(transformer, self.config.ulysses_degree)
-        te_kwargs, te_quant = self._meta_te_kwargs()
+        te_kwargs, te_quant = self.loader.plan_text_encoders()
         pipe = ZImagePipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             transformer=transformer,
@@ -146,15 +154,20 @@ class xFuserZImageModel(xFuserModel):
 
 @register_model("Tongyi-MAI/Z-Image-Turbo")
 @register_model("Z-Image-Turbo")
-@LoadDeclaration.declare("transformer", replicated=True)
 class xFuserZImageTurboModel(xFuserModel):
-
     min_diffusers_version = "0.36.0"
 
+    load_support = LoadSupport(
+        meta_transformers=('transformer',),
+        meta_text_encoders=('text_encoder',),
+        replicated_meta=True,
+        routes=STANDARD_LOAD_ROUTES,
+    )
     capabilities = ModelCapabilities(
         enable_tiling=True,
         enable_slicing=True,
         use_fp8_gemms=True,
+        use_fp8_text_encoder=True,
         use_int8_gemms=True,
         fully_shard_degree=True,
         use_parallel_vae=True,
@@ -203,9 +216,9 @@ class xFuserZImageTurboModel(xFuserModel):
             xFuserZImageTransformer2DWrapper,
         )
 
-        transformer = self._build_transformer(xFuserZImageTransformer2DWrapper)
+        transformer = self.loader.load_transformer(xFuserZImageTransformer2DWrapper)
         _set_effective_heads_for_ulysses(transformer, self.config.ulysses_degree)
-        te_kwargs, te_quant = self._meta_te_kwargs()
+        te_kwargs, te_quant = self.loader.plan_text_encoders()
         pipe = ZImagePipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             transformer=transformer,
