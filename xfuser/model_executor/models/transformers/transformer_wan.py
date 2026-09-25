@@ -17,7 +17,10 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
     get_runtime_state,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.model_executor.layers.attention_processor import (
     xFuserAttentionProcessorRegister
 )
@@ -26,6 +29,12 @@ from xfuser.core.vsa_attention import jenga_scheduled_drop_rate
 from xfuser.model_executor.layers.fused_qk_norm_rope_wan_flydsl import (
     fused_qk_norm_rope,
     _HAS_FLYDSL,
+)
+from xfuser.model_executor.models.transformers.base_transformer import (
+    xFuserTransformerBaseWrapper,
+)
+from xfuser.model_executor.models.transformers.register import (
+    xFuserTransformerWrappersRegister,
 )
 
 env_info = PACKAGES_CHECKER.get_packages_info()
@@ -94,6 +103,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             backend = get_runtime_state().get_cross_attention_backend()
 
         activation_dtype = hidden_states.dtype
+        compute_dtype = attn.norm_q.weight.dtype
+        hidden_states = hidden_states.to(dtype=compute_dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.to(
+                dtype=compute_dtype
+            )
 
         encoder_hidden_states_img = None
         if attn.add_k_proj is not None:
@@ -101,7 +116,12 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             image_context_length = encoder_hidden_states.shape[1] - 512
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
-        query, key, value = self._get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        query, key, value = self._get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+        query = query.to(dtype=compute_dtype)
+        key = key.to(dtype=compute_dtype)
+        value = value.to(dtype=compute_dtype)
 
         # Collapse norm_q -> norm_k -> apply_rotary_emb(q) -> apply_rotary_emb(k)
         # into a single FlyDSL kernel: inductor cannot fuse RoPE into the norm
@@ -115,6 +135,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
             query, key = fused_qk_norm_rope(
                 query, key, attn.norm_q, attn.norm_k, rotary_emb[0], rotary_emb[1], attn.heads
             )
+            query = query.to(dtype=compute_dtype)
+            key = key.to(dtype=compute_dtype)
             value = value.unflatten(2, (attn.heads, -1))
         else:
             query, key, value = self._qk_norm_rope_reference(attn, query, key, value, rotary_emb)
@@ -123,6 +145,8 @@ class xFuserWanAttnProcessor(WanAttnProcessor):
         hidden_states_img = None
         if encoder_hidden_states_img is not None:
             key_img, value_img = self._get_added_kv_projections(attn, encoder_hidden_states_img)
+            key_img = key_img.to(dtype=compute_dtype)
+            value_img = value_img.to(dtype=compute_dtype)
             key_img = attn.norm_added_k(key_img)
 
             key_img = key_img.unflatten(2, (attn.heads, -1))
@@ -424,3 +448,242 @@ class xFuserWanTransformer3DWrapper(WanTransformer3DModel):
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
+
+
+class xFuserWanPipeFusionAttnProcessor(xFuserWanAttnProcessor):
+    """Wan self-attention with one full-video stale-KV cache per PP patch."""
+
+    def __call__(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        compute_dtype = attn.norm_q.weight.dtype
+        hidden_states = hidden_states.to(dtype=compute_dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.to(
+                dtype=compute_dtype
+            )
+        # Cross attention is deliberately dense and has no spatial cache.
+        if encoder_hidden_states is not None:
+            return super().__call__(
+                attn, hidden_states, encoder_hidden_states, attention_mask, rotary_emb
+            )
+
+        query, key, value = self._get_qkv_projections(
+            attn, hidden_states, None
+        )
+        query = query.to(dtype=compute_dtype)
+        key = key.to(dtype=compute_dtype)
+        value = value.to(dtype=compute_dtype)
+        if _HAS_FLYDSL and rotary_emb is not None:
+            query, key = fused_qk_norm_rope(
+                query, key, attn.norm_q, attn.norm_k,
+                rotary_emb[0], rotary_emb[1], attn.heads,
+            )
+            query = query.to(dtype=compute_dtype)
+            key = key.to(dtype=compute_dtype)
+            value = value.unflatten(2, (attn.heads, -1))
+        else:
+            query, key, value = self._qk_norm_rope_reference(
+                attn, query, key, value, rotary_emb
+            )
+
+        state = get_runtime_state()
+        if state.num_pipeline_patch > 1:
+            if not state.patch_mode:
+                grid = getattr(attn, "_xfuser_wan_grid", None)
+                if grid is None:
+                    raise RuntimeError("Wan PipeFusion attention is missing grid metadata")
+                frames, rows, width = grid
+
+                def patch_order(tensor):
+                    tensor = tensor.reshape(
+                        tensor.shape[0], frames, rows, width,
+                        tensor.shape[-2], tensor.shape[-1],
+                    )
+                    patch_rows = [
+                        value // getattr(attn, "_xfuser_wan_patch_height")
+                        for value in state.pp_patches_height
+                    ]
+                    return torch.cat(
+                        [
+                            value.flatten(1, 3)
+                            for value in tensor.split(patch_rows, dim=2)
+                        ],
+                        dim=1,
+                    )
+
+                key, value = patch_order(key), patch_order(value)
+            key, value = get_cache_manager().update_and_get_kv_cache(
+                new_kv=[key, value],
+                layer=attn,
+                slice_dim=1,
+                layer_type="attn",
+            )
+        dtype = query.dtype
+        output = self.attention_function(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attention_kwargs=self.attention_kwargs,
+            attn_layer=None if state.num_pipeline_patch > 1 else attn,
+        ).transpose(1, 2)
+        output = output.flatten(2, 3).to(dtype)
+        output = attn.to_out[0](output)
+        return attn.to_out[1](output)
+
+
+@xFuserTransformerWrappersRegister.register(WanTransformer3DModel)
+class xFuserWanPipeFusionTransformerWrapper(xFuserTransformerBaseWrapper):
+    """Stage-local Wan wrapper.
+
+    PipeFusion patches are latent-height stripes containing every latent frame
+    and the complete width.  This keeps temporal neighborhoods intact.
+    """
+
+    transformer_blocks_name = ["blocks"]
+
+    def __init__(self, transformer: WanTransformer3DModel):
+        for block in transformer.blocks:
+            block.attn1.processor = xFuserWanPipeFusionAttnProcessor()
+            block.attn2.processor = xFuserWanAttnProcessor(
+                use_ulysses_parallel_attention=False, is_cross_attention=True
+            )
+        super().__init__(
+            transformer=transformer,
+            submodule_name_to_wrap=[],
+            transformer_blocks_name=self.transformer_blocks_name,
+        )
+        cache_manager = get_cache_manager()
+        for block in self.blocks:
+            if not cache_manager.has_cache_entry(block.attn1):
+                cache_manager.register_cache_entry(block.attn1, "attn")
+        register_fp8_comms_eligible_modules(
+            self, [block.attn1 for block in self.blocks]
+        )
+
+    def _rotary_emb(
+        self,
+        num_frames: int,
+        patch_height: int,
+        width: int,
+        patch_start_height: int,
+    ):
+        p_t, p_h, p_w = self.config.patch_size
+        ppf, pph, ppw = num_frames // p_t, patch_height // p_h, width // p_w
+        row = patch_start_height // p_h
+        split_sizes = [self.rope.t_dim, self.rope.h_dim, self.rope.w_dim]
+        cos_t, cos_h, cos_w = self.rope.freqs_cos.split(split_sizes, dim=1)
+        sin_t, sin_h, sin_w = self.rope.freqs_sin.split(split_sizes, dim=1)
+
+        def expand(t, h, w):
+            t = t[:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+            h = h[row : row + pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+            w = w[:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+            return torch.cat([t, h, w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+
+        return expand(cos_t, cos_h, cos_w), expand(sin_t, sin_h, sin_w)
+
+    @staticmethod
+    def _set_grid_metadata(block, grid, patch_height):
+        attention = getattr(block, "attn1", None)
+        if attention is not None:
+            attention._xfuser_wan_grid = grid
+            attention._xfuser_wan_patch_height = patch_height
+            return
+        for child in getattr(block, "transformer_blocks", ()):
+            xFuserWanPipeFusionTransformerWrapper._set_grid_metadata(
+                child, grid, patch_height
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        pipeline_hidden_states: Optional[torch.Tensor] = None,
+        patch_start_height: int = 0,
+        return_dict: bool = True,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        p_t, p_h, p_w = self.config.patch_size
+        rotary_emb = self._rotary_emb(
+            num_frames, height, width, patch_start_height
+        )
+
+        if timestep.ndim == 2:
+            ts_seq_len = timestep.shape[1]
+            timestep_input = timestep.flatten()
+        else:
+            ts_seq_len = None
+            timestep_input = timestep
+        temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
+            self.condition_embedder(
+                timestep_input,
+                encoder_hidden_states,
+                encoder_hidden_states_image,
+                timestep_seq_len=ts_seq_len,
+            )
+        )
+        if ts_seq_len is not None:
+            timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        else:
+            timestep_proj = timestep_proj.unflatten(1, (6, -1))
+        if encoder_hidden_states_image is not None:
+            encoder_hidden_states = torch.cat(
+                [encoder_hidden_states_image, encoder_hidden_states], dim=1
+            )
+
+        if is_pipeline_first_stage():
+            states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+        else:
+            if pipeline_hidden_states is None:
+                raise ValueError("A non-first Wan PP stage requires pipeline_hidden_states")
+            states = pipeline_hidden_states
+
+        grid = (num_frames // p_t, height // p_h, width // p_w)
+        for block in self.blocks:
+            self._set_grid_metadata(block, grid, p_h)
+            states = block(
+                states, encoder_hidden_states, timestep_proj, rotary_emb
+            )
+
+        if is_pipeline_last_stage():
+            if temb.ndim == 3:
+                shift, scale = (
+                    self.scale_shift_table.unsqueeze(0).to(temb.device)
+                    + temb.unsqueeze(2)
+                ).chunk(2, dim=2)
+                shift, scale = shift.squeeze(2), scale.squeeze(2)
+            else:
+                shift, scale = (
+                    self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)
+                ).chunk(2, dim=1)
+            states = (
+                self.norm_out(states.float()) * (1 + scale.to(states.device))
+                + shift.to(states.device)
+            ).type_as(states)
+            states = states.to(dtype=self.proj_out.weight.dtype)
+            states = self.proj_out(states)
+            states = states.reshape(
+                batch_size,
+                num_frames // p_t,
+                height // p_h,
+                width // p_w,
+                p_t,
+                p_h,
+                p_w,
+                -1,
+            )
+            states = states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+            states = states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        if not return_dict:
+            return (states,)
+        return Transformer2DModelOutput(sample=states)

@@ -354,6 +354,15 @@ class xFuserModel(abc.ABC):
 
         self.loader.preflight(world_size=get_world_group().world_size)
         self.engine_config, _ = self.config.create_config()
+        # Runner-managed VAE setup happens after the pipeline is loaded, where
+        # VAEManager can choose row sharding or whole-tile distribution. Legacy
+        # xFuser pipeline wrappers otherwise parallelize the decoder during
+        # construction and VAEManager would wrap that decoder a second time.
+        self.engine_config.runtime_config.runner_managed_parallel_vae = True
+        # The runner applies its model-specific compile mode after loading. Avoid
+        # compiling the legacy pipeline wrapper's forward first and then wrapping
+        # that compiled callable in a second torch.compile layer.
+        self.engine_config.runtime_config.runner_managed_torch_compile = True
         log("Loading model pipeline...")
         self.pipe = self._load_model_checked()
 
@@ -459,23 +468,25 @@ class xFuserModel(abc.ABC):
             else cache_method
         )
         pp_size = get_pipeline_parallel_world_size()
-        if engine_method == "dbcache" and pp_size > 1:
-            raise ValueError(
-                f"dbcache is incompatible with PipeFusion (PP={pp_size}): "
-                "the residual-diff skip decision is computed via a collective that only runs on the "
-                "stage holding the cached block, so the world collective deadlocks. Disable dbcache "
-                "or set --pipefusion_parallel_degree 1."
-            )
         if engine_method == "dbcache" and get_data_parallel_world_size() > 1:
             raise ValueError(
                 "dbcache is incompatible with data parallelism because its cache "
                 "decision is synchronized across the world group. Set "
                 "--data_parallel_degree 1."
             )
-        if engine_method in ("teacache", "fbcache") and pp_size > 1:
+        if cache_method in ("teacache", "fbcache") and pp_size > 1:
             raise ValueError(
-                f"{engine_method} is incompatible with PipeFusion (PP={pp_size}). "
+                f"{cache_method} is incompatible with PipeFusion (PP={pp_size}). "
                 "Set --pipefusion_parallel_degree 1."
+            )
+        if (
+            engine_method == "dbcache"
+            and pp_size > 1
+            and not isinstance(method_cfg, DBCacheSettings)
+        ):
+            raise ValueError(
+                "dbcache with PipeFusion requires an explicit model-specific "
+                "DBCacheSettings declaration."
             )
         if cache_method == "teacache" and get_tensor_model_parallel_world_size() > 1:
             raise RuntimeError("teacache requires TP=1")
@@ -509,6 +520,14 @@ class xFuserModel(abc.ABC):
     def _validate_config(self, config: xFuserArgs) -> None:
         """ Validate if the model supports requested config """
         config._validate_gemm_quantization_flags()
+        if (
+            config.pipefusion_parallel_degree > 1
+            and config.warmup_steps < 1
+        ):
+            raise ValueError(
+                "PipeFusion requires at least one synchronous denoising step "
+                "to initialize its cross-step KV cache."
+            )
         for key in ModelCapabilities.__annotations__.keys():
             config_value = getattr(config, key, None)  # Some config options might not be set in the CLI, such as support for specific attention backends.
             if isinstance(config_value, int) and not isinstance(config_value, bool):
@@ -688,10 +707,10 @@ class xFuserModel(abc.ABC):
     def _compile_model(self, input_args: dict) -> None:
         """Compile pipe components with torch.compile.
 
-        When FSDP is active (fully_shard_degree > 1), compiles each component's
-        FSDP-wrapped block lists individually (read from fsdp_strategy wrap_attrs)
-        to avoid dynamo tracing through FSDP2 forward_pre_hooks and fragmenting
-        the graph at every block boundary.
+        Under FSDP, compiles each component's wrapped block lists individually
+        (read from fsdp_strategy wrap_attrs) to avoid tracing through FSDP
+        hooks. PipeFusion instead compiles the already-sliced local stage as
+        one unit; its patch/KV-cache lifecycle crosses block boundaries.
         """
         self._enable_compute_comm_overlap()
 
@@ -701,7 +720,18 @@ class xFuserModel(abc.ABC):
             component = getattr(self.pipe, component_name, None)
             if component is None:
                 continue
-            if self.config.fully_shard_degree > 1 or self.config.cache_method:
+            compile_kwargs = {"mode": mode, "dynamic": dynamic}
+            if self.config.pipefusion_parallel_degree > 1:
+                component.forward = torch.compile(
+                    component.forward, **compile_kwargs
+                )
+            elif (
+                self.config.fully_shard_degree > 1
+                or (
+                    self.config.cache_method
+                    and self.config.pipefusion_parallel_degree == 1
+                )
+            ):
                 # Per-block compile: leaves transformer as original object so cache-dit's
                 # transformer.forward patch remains visible during compiled execution.
                 wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
@@ -713,14 +743,24 @@ class xFuserModel(abc.ABC):
                         block_list = None
                     if block_list is not None:
                         for i in range(len(block_list)):
-                            block_list[i] = torch.compile(block_list[i], mode=mode, dynamic=dynamic)
+                            block_list[i] = torch.compile(
+                                block_list[i], **compile_kwargs
+                            )
                         compiled_any = True
                 if compiled_any and mode in self.CUDAGRAPH_COMPILE_MODES:
                     self._mark_cudagraph_steps(component)
                 if not compiled_any:
-                    setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
+                    setattr(
+                        self.pipe,
+                        component_name,
+                        torch.compile(component, **compile_kwargs),
+                    )
             else:
-                setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
+                setattr(
+                    self.pipe,
+                    component_name,
+                    torch.compile(component, **compile_kwargs),
+                )
         compile_args = copy.deepcopy(input_args)
         warmup_steps = self._get_compile_warmup_steps(input_args)
         if warmup_steps is not None:
@@ -883,11 +923,17 @@ class xFuserModel(abc.ABC):
         self._validate_args(input_args)
         input_args = self._split_prompts_for_dp(input_args)
 
-        schedule = torch.profiler.schedule(
-            wait=self.config.profile_wait,
-            warmup=self.config.profile_warmup,
-            active=self.config.profile_active,
-        )
+        schedule = None
+        if (
+            self.config.profile_wait
+            or self.config.profile_warmup
+            or self.config.profile_active != 1
+        ):
+            schedule = torch.profiler.schedule(
+                wait=self.config.profile_wait,
+                warmup=self.config.profile_warmup,
+                active=self.config.profile_active,
+            )
         num_repetitions = self.config.profile_wait + self.config.profile_warmup + self.config.profile_active
         with_stack = self.config.profile_with_stack
         batch_size = self.config.batch_size or 1
@@ -974,6 +1020,34 @@ class xFuserModel(abc.ABC):
         profile_file = f"{self.config.output_directory}/profile_trace_rank_{get_world_group().rank}.json.gz"
         profile.export_chrome_trace(profile_file)
         log(f"Profile trace saved to {profile_file}", log_from_all_processes=True)
+        averages = profile.key_averages()
+        for event in averages:
+            if event.key in {
+                "xdit::pipeline_recv_wait",
+                "aten::_local_scalar_dense",
+                "record_param_comms",
+            }:
+                log(
+                    "Profile focus "
+                    f"{event.key}: calls={event.count} "
+                    f"self_cpu_ms={event.self_cpu_time_total / 1000:.3f} "
+                    f"cpu_total_ms={event.cpu_time_total / 1000:.3f}",
+                    log_from_all_processes=True,
+                )
+        log(
+            "Profile CUDA summary:\n"
+            + averages.table(
+                sort_by="self_cuda_time_total", row_limit=40
+            ),
+            log_from_all_processes=True,
+        )
+        log(
+            "Profile CPU summary:\n"
+            + averages.table(
+                sort_by="self_cpu_time_total", row_limit=40
+            ),
+            log_from_all_processes=True,
+        )
 
     def prepare_run(self, input_args: dict) -> None:
         """Prepare model state before a pipeline invocation."""
@@ -1042,6 +1116,9 @@ class xFuserModel(abc.ABC):
         height = input_args["height"]
         width = input_args["width"]
         name = f"{self.settings.output_name}_u{ulysses_degree}r{ring_degree}_tc_{use_compile}_{height}x{width}"
+        if self.config.pipefusion_parallel_degree > 1:
+            patches = self.config.num_pipeline_patch or self.config.pipefusion_parallel_degree
+            name += f"_pp{self.config.pipefusion_parallel_degree}_patch{patches}"
         if self.config.task:
             name += f"_{self.config.task}"
         return name

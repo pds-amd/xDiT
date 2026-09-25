@@ -22,7 +22,7 @@ from .blockwise_ownership import (
     record_blockwise_ownership,
 )
 from .checkpoint import CheckpointManifest, CheckpointRequest
-from .contracts import UnsupportedLoadContract
+from .contracts import UnsupportedLoadContract, uses_pipeline_stage_meta
 
 
 def build_transformer_structure(wrapper_cls, request: CheckpointRequest, init_kwargs):
@@ -188,7 +188,8 @@ def load_transformer(
 
     fsdp_meta = loader.fsdp_meta_load()
     replicated_meta = False if fsdp_meta else loader.replicated_broadcast_load()
-    if fsdp_meta or replicated_meta:
+    pipeline_stage_meta = uses_pipeline_stage_meta(model.config)
+    if fsdp_meta or replicated_meta or pipeline_stage_meta:
         if adapter is not None:
             record_blockwise_ownership(
                 ledger,

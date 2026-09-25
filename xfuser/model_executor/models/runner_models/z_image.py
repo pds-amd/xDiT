@@ -19,6 +19,7 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     STANDARD_LOAD_ROUTES,
 )
+from xfuser.core.utils.runner_utils import log
 
 
 def _normalize_prompt(prompt_input):
@@ -117,6 +118,9 @@ class xFuserZImageModel(xFuserModel):
         routes=STANDARD_LOAD_ROUTES,
     )
     capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        pipefusion_parallel_degree=True,
         use_cfg_parallel=True,
         enable_tiling=True,
         enable_slicing=True,
@@ -150,7 +154,11 @@ class xFuserZImageModel(xFuserModel):
         step_cache_config={
             "dbcache":DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
-                    blocks=(("layers", "Pattern_3"),),
+                    blocks=(
+                        ("noise_refiner", "Pattern_3"),
+                        ("context_refiner", "Pattern_3"),
+                        ("layers", "Pattern_3"),
+                    ),
                 ),
                 preset=DBCachePreset(Fn_compute_blocks=3, residual_diff_threshold=0.12, scm_policy="ultra"),
             ),
@@ -173,6 +181,31 @@ class xFuserZImageModel(xFuserModel):
             ]
 
     def _load_model(self) -> DiffusionPipeline:
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_z_image import (
+                ZImageTransformer2DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_z_image import (
+                xFuserZImagePipeline,
+            )
+
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    ZImageTransformer2DModel
+                )
+            )
+            pipe = xFuserZImagePipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=self.engine_config.runtime_config.dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+            return pipe
+
         from diffusers import ZImagePipeline
         from xfuser.model_executor.models.transformers.transformer_z_image import (
             xFuserZImageTransformer2DWrapper,
@@ -191,6 +224,16 @@ class xFuserZImageModel(xFuserModel):
         _keep_timesteps_host_resident(pipe)
         return pipe
 
+    def _validate_args(self, input_args: dict) -> None:
+        super()._validate_args(input_args)
+        if self.config.pipefusion_parallel_degree > 1 and (
+            self.config.ulysses_degree > 1 or self.config.ring_degree > 1
+        ):
+            raise ValueError(
+                "Z-Image PipeFusion cannot currently be combined with "
+                "Ulysses or Ring sequence parallelism."
+            )
+
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         prompt = _normalize_prompt(input_args["prompt"])
         output = self.pipe(
@@ -201,7 +244,9 @@ class xFuserZImageModel(xFuserModel):
             guidance_scale=input_args["guidance_scale"],
             generator=self._make_generator(input_args["seed"]),
         )
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(
+            images=output.images if output else [], pipe_args=input_args
+        )
 
 
 @register_model("Tongyi-MAI/Z-Image-Turbo")
@@ -216,6 +261,9 @@ class xFuserZImageTurboModel(xFuserModel):
         routes=STANDARD_LOAD_ROUTES,
     )
     capabilities = ModelCapabilities(
+        ulysses_degree=True,
+        ring_degree=True,
+        pipefusion_parallel_degree=True,
         enable_tiling=True,
         enable_slicing=True,
         use_fp8_gemms=True,
@@ -264,6 +312,31 @@ class xFuserZImageTurboModel(xFuserModel):
             ]
 
     def _load_model(self) -> DiffusionPipeline:
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_z_image import (
+                ZImageTransformer2DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_z_image import (
+                xFuserZImagePipeline,
+            )
+
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    ZImageTransformer2DModel
+                )
+            )
+            pipe = xFuserZImagePipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=self.engine_config.runtime_config.dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+            return pipe
+
         from diffusers import ZImagePipeline
         from xfuser.model_executor.models.transformers.transformer_z_image import (
             xFuserZImageTransformer2DWrapper,
@@ -282,8 +355,47 @@ class xFuserZImageTurboModel(xFuserModel):
         _keep_timesteps_host_resident(pipe)
         return pipe
 
+    def _validate_args(self, input_args: dict) -> None:
+        super()._validate_args(input_args)
+        if self.config.pipefusion_parallel_degree > 1 and (
+            self.config.ulysses_degree > 1 or self.config.ring_degree > 1
+        ):
+            raise ValueError(
+                "Z-Image-Turbo PipeFusion cannot currently be combined with "
+                "Ulysses or Ring sequence parallelism."
+            )
+
+    def _begin_sampler_timing(self) -> dict:
+        transformer = self.pipe.transformer
+        state = getattr(transformer, "_xdit_sampler_timing_state", None)
+        if state is None:
+            state = {"active": False, "calls": 0, "start": None, "end": None}
+            original_forward = transformer.forward
+
+            @functools.wraps(original_forward)
+            def timed_forward(*args, **kwargs):
+                if state["active"] and state["calls"] == 0:
+                    state["start"].record()
+                output = original_forward(*args, **kwargs)
+                if state["active"]:
+                    state["end"].record()
+                    state["calls"] += 1
+                return output
+
+            transformer.forward = timed_forward
+            transformer._xdit_sampler_timing_state = state
+
+        state.update(
+            active=True,
+            calls=0,
+            start=torch.cuda.Event(enable_timing=True),
+            end=torch.cuda.Event(enable_timing=True),
+        )
+        return state
+
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
         prompt = _normalize_prompt(input_args["prompt"])
+        sampler_timing = self._begin_sampler_timing()
         output = self.pipe(
             height=input_args["height"],
             width=input_args["width"],
@@ -292,4 +404,19 @@ class xFuserZImageTurboModel(xFuserModel):
             guidance_scale=input_args["guidance_scale"],
             generator=self._make_generator(input_args["seed"]),
         )
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        sampler_timing["active"] = False
+        if sampler_timing["calls"]:
+            sampler_timing["end"].synchronize()
+            sampler_seconds = (
+                sampler_timing["start"].elapsed_time(sampler_timing["end"])
+                / 1000
+            )
+            log(
+                "Sampler timing: "
+                f"{sampler_seconds:.6f}s, "
+                f"{sampler_timing['calls'] / sampler_seconds:.6f} it/s "
+                f"({sampler_timing['calls']} transformer calls)"
+            )
+        return DiffusionOutput(
+            images=output.images if output else [], pipe_args=input_args
+        )

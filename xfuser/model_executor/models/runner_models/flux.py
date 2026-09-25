@@ -19,12 +19,30 @@ from xfuser.core.utils.runner_utils import (
     log,
     resize_and_crop_image,
 )
-from xfuser.core.distributed import get_runtime_state, get_pipeline_parallel_world_size
+from xfuser.core.distributed import (
+    get_runtime_state,
+    get_pipeline_parallel_world_size,
+)
 from xfuser import xFuserFluxPipeline
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     STANDARD_LOAD_ROUTES,
 )
+
+
+def _ensure_flux2_pipefusion_attention_quality(engine_config) -> None:
+    runtime_config = engine_config.runtime_config
+    backend = runtime_config.attention_backend
+    backend_name = getattr(backend, "name", str(backend)).upper()
+    if (
+        backend_name == "AITER_FLYDSL_FP8"
+        and engine_config.parallel_config.sp_degree == 1
+    ):
+        runtime_config.attention_backend = "AITER_FLYDSL"
+        log(
+            "FLUX.2 PipeFusion disables FP8 FlyDSL attention because its "
+            "full-sequence warmup corrupts denoising; using BF16 FlyDSL."
+        )
 
 
 @register_model("black-forest-labs/FLUX.1-dev")
@@ -82,9 +100,17 @@ class xFuserFluxModel(xFuserModel):
             "teacache": None,
             "dbcache": DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
-                    blocks=(("transformer_blocks", "Pattern_1"), ("single_transformer_blocks", "Pattern_1")),
+                    blocks=(
+                        ("transformer_blocks", "Pattern_1"),
+                        ("single_transformer_blocks", "Pattern_1"),
+                    ),
+                    pipefusion_global_scm_cache=True,
                 ),
-                preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.12, scm_policy="ultra"),
+                preset=DBCachePreset(
+                    Fn_compute_blocks=2,
+                    residual_diff_threshold=0.12,
+                    scm_policy="ultra",
+                ),
             ),
         },
     )
@@ -96,11 +122,31 @@ class xFuserFluxModel(xFuserModel):
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            from diffusers.models.transformers.transformer_flux import (
+                FluxTransformer2DModel,
+            )
+
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    FluxTransformer2DModel
+                )
+            )
             pipe = xFuserFluxPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from diffusers import FluxPipeline
             from xfuser.model_executor.models.transformers.transformer_flux import (
@@ -154,6 +200,7 @@ class xFuserFluxKontextModel(xFuserModel):
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
+        pipefusion_parallel_degree=True,
         use_fp8_gemms=True,
         use_fp8_text_encoder=True,
         enable_tiling=True,
@@ -201,20 +248,52 @@ class xFuserFluxKontextModel(xFuserModel):
     )
 
     def _load_model(self) -> DiffusionPipeline:
-        from diffusers import FluxKontextPipeline
-        from xfuser.model_executor.models.transformers.transformer_flux import (
-            xFuserFlux1Transformer2DWrapper,
-        )
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_flux import (
+                FluxTransformer2DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_flux_kontext import (
+                xFuserFluxKontextPipeline,
+            )
 
-        transformer = self.loader.load_transformer(xFuserFlux1Transformer2DWrapper)
-        te_kwargs, te_quant = self.loader.plan_text_encoders()
-        pipe = FluxKontextPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            torch_dtype=torch.bfloat16,
-            transformer=transformer,
-            quantization_config=te_quant,
-            **te_kwargs,
-        )
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    FluxTransformer2DModel
+                )
+            )
+            pipe = xFuserFluxKontextPipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+        else:
+            from diffusers import FluxKontextPipeline
+            from xfuser.model_executor.models.transformers.transformer_flux import (
+                xFuserFlux1Transformer2DWrapper,
+            )
+
+            transformer = self.loader.load_transformer(
+                xFuserFlux1Transformer2DWrapper
+            )
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
+            pipe = FluxKontextPipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=torch.bfloat16,
+                transformer=transformer,
+                quantization_config=te_quant,
+                **te_kwargs,
+            )
         return pipe
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
@@ -331,9 +410,16 @@ class xFuserFlux2Model(xFuserModel):
             "fbcache": None,
             "dbcache": DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
-                    blocks=(("transformer_blocks", "Pattern_1"), ("single_transformer_blocks", "Pattern_2")),
+                    blocks=(
+                        ("transformer_blocks", "Pattern_1"),
+                        ("single_transformer_blocks", "Pattern_2"),
+                    ),
                 ),
-                preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.12, scm_policy="ultra"),
+                preset=DBCachePreset(
+                    Fn_compute_blocks=2,
+                    residual_diff_threshold=0.12,
+                    scm_policy="ultra",
+                ),
             ),
         },
     )
@@ -353,15 +439,35 @@ class xFuserFlux2Model(xFuserModel):
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            _ensure_flux2_pipefusion_attention_quality(self.engine_config)
+            from diffusers.models.transformers.transformer_flux2 import (
+                Flux2Transformer2DModel,
+            )
             from xfuser.model_executor.pipelines.pipeline_flux2 import (
                 xFuserFlux2Pipeline,
             )
 
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    Flux2Transformer2DModel
+                )
+            )
             pipe = xFuserFlux2Pipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=self.engine_config.runtime_config.dtype,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from xfuser.model_executor.models.transformers.transformer_flux2 import (
                 xFuserFlux2Transformer2DWrapper,
@@ -481,15 +587,35 @@ class xFuserFlux2Klein9BModel(xFuserModel):
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            _ensure_flux2_pipefusion_attention_quality(self.engine_config)
+            from diffusers.models.transformers.transformer_flux2 import (
+                Flux2Transformer2DModel,
+            )
             from xfuser.model_executor.pipelines.pipeline_flux2 import (
                 xFuserFlux2KleinPipeline,
             )
 
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    Flux2Transformer2DModel
+                )
+            )
             pipe = xFuserFlux2KleinPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=self.engine_config.runtime_config.dtype,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from xfuser.model_executor.models.transformers.transformer_flux2 import (
                 xFuserFlux2Transformer2DWrapper,

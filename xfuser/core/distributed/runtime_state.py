@@ -59,6 +59,11 @@ logger = init_logger(__name__)
 env_info = PACKAGES_CHECKER.get_packages_info()
 
 
+def _pipeline_family_name(pipeline) -> str:
+    """Normalize xFuser wrappers to their upstream pipeline family name."""
+    return type(pipeline).__name__.removeprefix("xFuser")
+
+
 def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -480,25 +485,43 @@ class DiTRuntimeState(RuntimeState):
         self.cogvideox = False
         self.consisid = False
         self.hunyuan_video = False
-        if pipeline.__class__.__name__.startswith(("CogVideoX", "ConsisID", "HunyuanVideo", "Wan")):
-            if pipeline.__class__.__name__.startswith("CogVideoX"):
+        self.wan_video = False
+        pipeline_name = _pipeline_family_name(pipeline)
+        if pipeline_name.startswith(
+            ("CogVideoX", "ConsisID", "HunyuanVideo", "Wan")
+        ):
+            if pipeline_name.startswith("CogVideoX"):
                 self.cogvideox = True
-            elif pipeline.__class__.__name__.startswith("ConsisID"):
+            elif pipeline_name.startswith("ConsisID"):
                 self.consisid = True
+            elif pipeline_name.startswith("Wan"):
+                self.wan_video = True
             else:
                 self.hunyuan_video = True
+            patch_size = pipeline.transformer.config.patch_size
+            spatial_patch_size = (
+                patch_size[1] if self.wan_video else patch_size
+            )
+            if self.wan_video:
+                self.wan_temporal_patch_size = patch_size[0]
             self._set_cogvideox_parameters(
                 vae_scale_factor_spatial=pipeline.vae_scale_factor_spatial,
                 vae_scale_factor_temporal=pipeline.vae_scale_factor_temporal,
-                backbone_patch_size=pipeline.transformer.config.patch_size,
+                backbone_patch_size=spatial_patch_size,
                 backbone_in_channel=pipeline.transformer.config.in_channels,
                 backbone_inner_dim=pipeline.transformer.config.num_attention_heads
                 * pipeline.transformer.config.attention_head_dim,
             )
-        elif pipeline.__class__.__name__.startswith("ZImage"):
+        elif pipeline_name.startswith("ZImage"):
+            all_patch_size = pipeline.transformer.config.all_patch_size
+            patch_size = (
+                all_patch_size[0]
+                if isinstance(all_patch_size, (list, tuple))
+                else all_patch_size
+            )
             self._set_model_parameters(
                 vae_scale_factor=pipeline.vae_scale_factor,
-                backbone_patch_size=pipeline.transformer.config.all_patch_size,
+                backbone_patch_size=patch_size,
                 backbone_in_channel=pipeline.transformer.config.in_channels,
                 backbone_inner_dim=pipeline.transformer.config.n_heads
                 * pipeline.transformer.config.axes_dims[-1]
@@ -758,12 +781,34 @@ class DiTRuntimeState(RuntimeState):
             self._calc_cogvideox_patches_metadata()
         elif self.consisid:
             self._calc_consisid_patches_metadata()
+        elif self.wan_video:
+            self._calc_wan_patches_metadata()
         elif self.hunyuan_video:
             # TODO: implement the hunyuan video patches metadata
             pass
         else:
             self._calc_patches_metadata()
         self._reset_recv_buffer()
+
+    def _calc_wan_patches_metadata(self):
+        """Build height-stripe metadata while retaining Wan's temporal tokens."""
+        self._calc_cogvideox_patches_metadata()
+        p_t = self.wan_temporal_patch_size
+        latent_frames = (
+            (self.input_config.num_frames - 1) // self.vae_scale_factor_temporal + 1
+        )
+        temporal_tokens = latent_frames // p_t
+        self.pp_patches_token_num = [
+            value * temporal_tokens for value in self.pp_patches_token_num
+        ]
+        self.pp_patches_token_start_idx_local = [
+            sum(self.pp_patches_token_num[:i])
+            for i in range(len(self.pp_patches_token_num) + 1)
+        ]
+        self.pp_patches_token_start_end_idx_global = [
+            self.pp_patches_token_start_idx_local[i : i + 2]
+            for i in range(len(self.pp_patches_token_num))
+        ]
 
     def _calc_patches_metadata(self):
         num_sp_patches = get_sequence_parallel_world_size()

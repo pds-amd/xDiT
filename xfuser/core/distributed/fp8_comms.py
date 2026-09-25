@@ -27,6 +27,7 @@ else:
     PROCESS_GROUP = None
 
 logger = init_logger(__name__)
+_WARNED_PURE_PIPEFUSION = False
 
 _FP8_LOG_SCALES = os.environ.get("XFUSER_FP8_LOG_SCALES", "").lower() in ("1", "true")
 class Fp8CommsCall(NamedTuple):
@@ -96,8 +97,21 @@ class Fp8CommsState:
         if not runtime_config.use_fp8_comms:
             return None
         ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
+        pipeline_degree = config.parallel_config.pp_config.pp_degree or 1
         if ulysses_degree <= 1:
-            raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+            if pipeline_degree > 1:
+                global _WARNED_PURE_PIPEFUSION
+                if not _WARNED_PURE_PIPEFUSION:
+                    logger.warning(
+                        "--use_fp8_comms is an Ulysses all-to-all optimization "
+                        "and is inactive under pure PipeFusion; stage "
+                        "activations remain in the configured compute dtype."
+                    )
+                    _WARNED_PURE_PIPEFUSION = True
+                return None
+            raise ValueError(
+                "--use_fp8_comms requires ulysses_degree > 1."
+            )
         scale = runtime_config.fp8_comms_scale
         safety_factor = runtime_config.fp8_comms_safety_factor
         if scale is not None:
@@ -547,12 +561,21 @@ def validate_fp8_comms_config(config, capabilities, settings) -> None:
 
     if not capabilities.use_fp8_comms:
         raise ValueError(f"Model {settings.model_name} does not support --use_fp8_comms.")
-    if getattr(config, "pipefusion_parallel_degree", 1) > 1:
-        raise ValueError(
-            "--use_fp8_comms does not support PipeFusion because its joint-attention "
-            "path cannot mix FP8 communication tensors with BF16 joint tensors."
+    pipefusion = getattr(config, "pipefusion_parallel_degree", 1) > 1
+    ulysses = config.ulysses_degree or 1
+    if pipefusion:
+        if ulysses > 1:
+            raise ValueError(
+                "--use_fp8_comms does not support hybrid PipeFusion + Ulysses "
+                "because its joint-attention path cannot mix FP8 communication "
+                "tensors with BF16 joint tensors."
+            )
+        logger.warning(
+            "--use_fp8_comms is inactive under pure PipeFusion because there is "
+            "no Ulysses all-to-all collective to quantize."
         )
-    if (config.ulysses_degree or 1) <= 1:
+        return
+    if ulysses <= 1:
         raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
     if (
         config.enable_sequential_cpu_offload

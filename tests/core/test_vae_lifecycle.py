@@ -74,11 +74,12 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
         _decoding_vaes = xFuserModel._decoding_vaes
 
         def __init__(self):
+            self.engine = SimpleNamespace(runtime_config=SimpleNamespace())
             self.config = SimpleNamespace(
                 use_parallel_vae=True,
                 use_torch_compile=False,
                 cache_method=None,
-                create_config=lambda: (object(), None),
+                create_config=lambda: (self.engine, None),
             )
             self.loader = mock.Mock()
             self._vae_manager = mock.Mock()
@@ -87,6 +88,14 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
             )
 
         def _load_model_checked(self):
+            assert (
+                self.engine.runtime_config.runner_managed_parallel_vae
+                is True
+            )
+            assert (
+                self.engine.runtime_config.runner_managed_torch_compile
+                is True
+            )
             return Pipe(first)
 
         def _get_runtime_state_pipeline(self):

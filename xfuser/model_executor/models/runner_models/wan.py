@@ -759,6 +759,7 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
+        pipefusion_parallel_degree=True,
         fully_shard_degree=True,
         use_cfg_parallel=True,
         use_fp8_gemms=True,
@@ -783,6 +784,16 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
             raise ValueError(
                 "Wan2.2-TI2V supports CFG parallelism only for the i2v task."
             )
+        if config.pipefusion_parallel_degree > 1:
+            if config.task != "i2v":
+                raise ValueError(
+                    "Wan2.2-TI2V PipeFusion supports only the i2v task."
+                )
+            if config.ulysses_degree > 1 or config.ring_degree > 1:
+                raise ValueError(
+                    "Wan2.2-TI2V PipeFusion cannot currently be combined with "
+                    "Ulysses or Ring sequence parallelism."
+                )
 
     default_input_values = DefaultInputValues(
         height=736,
@@ -831,6 +842,31 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
     )
 
     def _load_model(self) -> DiffusionPipeline:
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_wan import (
+                WanTransformer3DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_wan_pipefusion import (
+                xFuserWanTI2VPipeFusionPipeline,
+            )
+
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    WanTransformer3DModel
+                )
+            )
+            pipe = xFuserWanTI2VPipeFusionPipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=self.engine_config.runtime_config.dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+            return pipe
+
         from xfuser.model_executor.models.transformers.transformer_wan import (
             xFuserWanTransformer3DWrapper,
         )
@@ -865,7 +901,9 @@ class xFuserWan22TI2VModel(xFuserWan21T2VModel):
         if self.config.task == "i2v":
             kwargs["image"] = input_args["image"]
         output = self.pipe(**kwargs)
-        return DiffusionOutput(videos=output.frames, pipe_args=input_args)
+        return DiffusionOutput(
+            videos=output.frames if output else [], pipe_args=input_args
+        )
 
     def _get_compile_warmup_steps(self, input_args: dict) -> Optional[int]:
         return None  # full warmup cycle

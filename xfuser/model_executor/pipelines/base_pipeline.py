@@ -1,8 +1,7 @@
 from abc import ABCMeta, abstractmethod
 from functools import wraps
 from xfuser.compat import version_at_least
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import sys
 import torch
 import torch.distributed
@@ -44,6 +43,10 @@ from xfuser.core.fast_attention import (
     fast_attention_compression,
 )
 from xfuser.model_executor.base_wrapper import xFuserBaseWrapper
+from xfuser.model_executor.pipefusion import (
+    PipeFusionStageOutputCache,
+    pipefusion_async_computation_mask,
+)
 
 from xfuser.envs import PACKAGES_CHECKER
 
@@ -187,7 +190,10 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         if vae is not None and engine_config.runtime_config.use_parallel_vae:
             if engine_config.parallel_config.vae_parallel_size > 0:
                 pipeline.vae.to("cpu")  # VAE is not executed in the current worker
-            elif not self.use_naive_forward():
+            elif (
+                not self.use_naive_forward()
+                and not engine_config.runtime_config.runner_managed_parallel_vae
+            ):
                 pipeline.vae = self._convert_vae(vae)
 
         super().__init__(module=pipeline)
@@ -453,9 +459,12 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
                     cache_config=cache_config,
                 )
         self.original_transformer = transformer
-        if enable_torch_compile or enable_onediff:
+        defer_torch_compile = (
+            self.engine_config.runtime_config.runner_managed_torch_compile
+        )
+        if (enable_torch_compile and not defer_torch_compile) or enable_onediff:
             if getattr(transformer, "forward") is not None:
-                if enable_torch_compile:
+                if enable_torch_compile and not defer_torch_compile:
                     if "flash_attn" in sys.modules:
                         import flash_attn
                         if not version_at_least(flash_attn.__version__, "2.7.0") or not version_at_least(torch.__version__, "2.4.0"):
@@ -539,13 +548,64 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         latents = torch.cat(latents_list, dim=-2)
         return latents
 
+    def _pipefusion_async_computation_mask(
+        self,
+        num_timesteps: int,
+        warmup_steps: int,
+    ) -> Tuple[int, ...]:
+        return pipefusion_async_computation_mask(
+            self,
+            num_timesteps,
+            warmup_steps,
+        )
+
+    def _pipefusion_stage_output_cache(
+        self,
+        computation_mask: Sequence[int],
+        num_patches: int,
+    ) -> PipeFusionStageOutputCache:
+        return PipeFusionStageOutputCache(computation_mask, num_patches)
+
+    def _queue_pipefusion_recv_tasks(
+        self,
+        num_timesteps: int,
+        num_pipeline_warmup_steps: int,
+        *,
+        per_step_segments: Tuple[str, ...] = (),
+        per_patch_segments: Tuple[str, ...] = (),
+    ) -> None:
+        state = get_runtime_state()
+        recv_timesteps = (
+            num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
+        )
+        for _ in range(recv_timesteps):
+            if not is_pipeline_first_stage():
+                for segment in per_step_segments:
+                    get_pp_group().add_pipeline_recv_task(0, segment)
+            for patch_idx in range(state.num_pipeline_patch):
+                if not is_pipeline_first_stage():
+                    for segment in per_patch_segments:
+                        get_pp_group().add_pipeline_recv_task(
+                            patch_idx,
+                            segment,
+                        )
+                get_pp_group().add_pipeline_recv_task(patch_idx)
+
     def _init_async_pipeline(
         self,
         num_timesteps: int,
         latents: torch.Tensor,
         num_pipeline_warmup_steps: int,
+        *,
+        split_sizes: Optional[Sequence[int]] = None,
+        split_dim: int = 2,
+        recv_segments: Tuple[str, ...] = (),
+        per_patch_recv_segments: Tuple[str, ...] = (),
+        queue_receives: bool = True,
     ):
-        get_runtime_state().set_patched_mode(patch_mode=True)
+        state = get_runtime_state()
+        state.set_patched_mode(patch_mode=True)
+        split_sizes = split_sizes or state.pp_patches_height
 
         if is_pipeline_first_stage():
             # get latents computed in warmup stage
@@ -556,23 +616,22 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
                 else latents
             )
             patch_latents = list(
-                latents.split(get_runtime_state().pp_patches_height, dim=2)
+                latents.split(split_sizes, dim=split_dim)
             )
         elif is_pipeline_last_stage():
             patch_latents = list(
-                latents.split(get_runtime_state().pp_patches_height, dim=2)
+                latents.split(split_sizes, dim=split_dim)
             )
         else:
-            patch_latents = [
-                None for _ in range(get_runtime_state().num_pipeline_patch)
-            ]
+            patch_latents = [None for _ in range(state.num_pipeline_patch)]
 
-        recv_timesteps = (
-            num_timesteps - 1 if is_pipeline_first_stage() else num_timesteps
-        )
-        for _ in range(recv_timesteps):
-            for patch_idx in range(get_runtime_state().num_pipeline_patch):
-                get_pp_group().add_pipeline_recv_task(patch_idx)
+        if queue_receives:
+            self._queue_pipefusion_recv_tasks(
+                num_timesteps,
+                num_pipeline_warmup_steps,
+                per_step_segments=recv_segments,
+                per_patch_segments=per_patch_recv_segments,
+            )
 
         return patch_latents
 
@@ -613,12 +672,21 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
             return get_world_group().rank == 0
         else:
             return is_dp_last_group()
+
+    @staticmethod
+    def _release_transformer_kv_cache() -> None:
+        from xfuser.core.cache_manager.cache_manager import get_cache_manager
+
+        get_cache_manager().clear()
+        torch.cuda.empty_cache()
+
     def gather_latents_for_vae(self, latents:torch.Tensor):
         """gather latents from dp last group
         """
         # Only gather if we're using parallel VAE and not using naive forward
         if not (get_runtime_state().runtime_config.use_parallel_vae and not self.use_naive_forward()):
             return latents
+        self._release_transformer_kv_cache()
 
         rank = get_world_group().rank
         device = get_device(get_world_group().local_rank)
@@ -654,6 +722,7 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
     def gather_broadcast_latents(self, latents:torch.Tensor):
         """gather latents from dp last group and broacast final latents
         """
+        self._release_transformer_kv_cache()
         
         # ---------gather latents from dp last group-----------
         rank = get_world_group().rank
@@ -668,18 +737,26 @@ class xFuserPipelineBaseWrapper(xFuserBaseWrapper, metaclass=ABCMeta):
         torch.distributed.all_gather(dp_rank_list, torch.tensor([gather_rank],dtype=int,device=device))
         
         dp_rank_list = [int(dp_rank[0]) for dp_rank in dp_rank_list if int(dp_rank[0])!=-1]
-        dp_last_group = torch.distributed.new_group(dp_rank_list)
 
-        # gather latents from dp last group
-        if rank == dp_rank_list[-1]:
-            latents_list = [torch.zeros_like(latents) for _ in dp_rank_list]
-        else:
-            latents_list = None
-        if rank in dp_rank_list:
-            torch.distributed.gather(latents, latents_list, dst=dp_rank_list[-1], group=dp_last_group)
-
-        if rank == dp_rank_list[-1]:
-            latents = torch.cat(latents_list,dim=0)
+        # Pure PipeFusion has exactly one output owner, so creating another
+        # NCCL communicator and gathering to itself only wastes memory.
+        if len(dp_rank_list) > 1:
+            dp_last_group = torch.distributed.new_group(dp_rank_list)
+            if rank == dp_rank_list[-1]:
+                latents_list = [
+                    torch.zeros_like(latents) for _ in dp_rank_list
+                ]
+            else:
+                latents_list = None
+            if rank in dp_rank_list:
+                torch.distributed.gather(
+                    latents,
+                    latents_list,
+                    dst=dp_rank_list[-1],
+                    group=dp_last_group,
+                )
+            if rank == dp_rank_list[-1]:
+                latents = torch.cat(latents_list, dim=0)
         
         # ------broadcast latents to all nodes---------
         src = dp_rank_list[-1]

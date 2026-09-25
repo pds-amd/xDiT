@@ -33,4 +33,15 @@ __all__ = [
 # These need diffusers symbols newer than the install floor, so they are gated on their
 # module importing.
 _optional = optional_exporter(globals())
+_optional(".pipeline_flux_kontext", "xFuserFluxKontextPipeline")
 _optional(".pipeline_flux2", "xFuserFlux2Pipeline", "xFuserFlux2KleinPipeline")
+_optional(
+    ".pipeline_qwen_image",
+    "xFuserQwenImagePipeline",
+    "xFuserQwenImageEditPipeline",
+)
+_optional(".pipeline_z_image", "xFuserZImagePipeline")
+_optional(
+    ".pipeline_wan_pipefusion",
+    "xFuserWanTI2VPipeFusionPipeline",
+)

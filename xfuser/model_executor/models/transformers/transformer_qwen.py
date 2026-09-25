@@ -15,6 +15,19 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
     get_sp_group,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.core.distributed.runtime_state import get_runtime_state
+from xfuser.model_executor.layers.attention_processor import (
+    xFuserAttentionProcessorRegister,
+)
+from xfuser.model_executor.models.transformers.base_transformer import (
+    xFuserTransformerBaseWrapper,
+)
+from xfuser.model_executor.models.transformers.register import (
+    xFuserTransformerWrappersRegister,
 )
 from xfuser.model_executor.models.transformers.transformers_utils import chunk_and_pad_sequence, gather_and_unpad
 
@@ -138,6 +151,261 @@ class xFuserQwenDoubleStreamAttnProcessor:
         txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
 
         return img_attn_output, txt_attn_output
+
+
+@xFuserAttentionProcessorRegister.register(xFuserQwenDoubleStreamAttnProcessor)
+class xFuserQwenPipeFusionAttnProcessor(xFuserQwenDoubleStreamAttnProcessor):
+    """Qwen joint attention with PipeFusion's spatial KV cache."""
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        encoder_hidden_states_mask: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        target_image_tokens: Optional[int] = None,
+        reference_patch_start: Optional[int] = None,
+        reference_patch_end: Optional[int] = None,
+        latte_temporal_attention: bool = False,
+    ) -> torch.FloatTensor:
+        seq_txt = encoder_hidden_states.shape[1]
+
+        img_query = attn.to_q(hidden_states)
+        img_key = attn.to_k(hidden_states)
+        img_value = attn.to_v(hidden_states)
+        txt_query = attn.add_q_proj(encoder_hidden_states)
+        txt_key = attn.add_k_proj(encoder_hidden_states)
+        txt_value = attn.add_v_proj(encoder_hidden_states)
+
+        img_query = img_query.unflatten(-1, (attn.heads, -1))
+        img_key = img_key.unflatten(-1, (attn.heads, -1))
+        img_value = img_value.unflatten(-1, (attn.heads, -1))
+        txt_query = txt_query.unflatten(-1, (attn.heads, -1))
+        txt_key = txt_key.unflatten(-1, (attn.heads, -1))
+        txt_value = txt_value.unflatten(-1, (attn.heads, -1))
+
+        if _HAS_FLYDSL and image_rotary_emb is not None:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_query, img_key = flydsl_fused_qk_norm_rope(
+                img_query, img_key, attn.norm_q, attn.norm_k, _qwen_cos_sin(img_freqs)
+            )
+            txt_query, txt_key = flydsl_fused_qk_norm_rope(
+                txt_query, txt_key, attn.norm_added_q, attn.norm_added_k, _qwen_cos_sin(txt_freqs)
+            )
+        else:
+            if attn.norm_q is not None:
+                img_query = attn.norm_q(img_query)
+            if attn.norm_k is not None:
+                img_key = attn.norm_k(img_key)
+            if attn.norm_added_q is not None:
+                txt_query = attn.norm_added_q(txt_query)
+            if attn.norm_added_k is not None:
+                txt_key = attn.norm_added_k(txt_key)
+            if image_rotary_emb is not None:
+                img_freqs, txt_freqs = image_rotary_emb
+                img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
+                img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
+                txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
+                txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+
+        runtime_state = get_runtime_state()
+        if runtime_state.num_pipeline_patch > 1:
+            manager = get_cache_manager()
+            if (
+                runtime_state.patch_mode
+                and target_image_tokens is not None
+                and reference_patch_start is not None
+                and reference_patch_end is not None
+            ):
+                # Edit inputs are laid out [target, reference]. Update the two
+                # disjoint spatial ranges in the full-image cache independently.
+                combined = torch.cat([img_key, img_value], dim=-1)
+                cache = getattr(attn, "_xdit_kv_cache", None)
+                if cache is None:
+                    cache = combined
+                else:
+                    patch_idx = runtime_state.pipeline_patch_idx
+                    target_start = runtime_state.pp_patches_token_start_idx_local[patch_idx]
+                    target_end = runtime_state.pp_patches_token_start_idx_local[patch_idx + 1]
+                    total_target = runtime_state.pp_patches_token_start_idx_local[-1]
+                    cache[:, target_start:target_end, ...] = combined[:, :target_image_tokens, ...]
+                    cache[
+                        :,
+                        total_target + reference_patch_start : total_target + reference_patch_end,
+                        ...,
+                    ] = combined[:, target_image_tokens:, ...]
+                attn._xdit_kv_cache = cache
+                img_key, img_value = torch.chunk(cache, 2, dim=-1)
+            else:
+                img_key, img_value = manager.update_and_get_kv_cache(
+                    new_kv=[img_key, img_value],
+                    layer=attn,
+                    slice_dim=1,
+                    layer_type="attn",
+                )
+
+        joint_query = torch.cat([txt_query, img_query], dim=1)
+        joint_key = torch.cat([txt_key, img_key], dim=1)
+        joint_value = torch.cat([txt_value, img_value], dim=1)
+        joint_hidden_states = USP(
+            joint_query.transpose(1, 2),
+            joint_key.transpose(1, 2),
+            joint_value.transpose(1, 2),
+            dropout_p=0.0,
+            is_causal=False,
+            attn_layer=None if runtime_state.num_pipeline_patch > 1 else attn,
+        ).transpose(1, 2)
+        joint_hidden_states = joint_hidden_states.flatten(2, 3).to(joint_query.dtype)
+        txt_attn_output = joint_hidden_states[:, :seq_txt, :]
+        img_attn_output = joint_hidden_states[:, seq_txt:, :]
+        img_attn_output = attn.to_out[0](img_attn_output.contiguous())
+        if len(attn.to_out) > 1:
+            img_attn_output = attn.to_out[1](img_attn_output)
+        txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+        return img_attn_output, txt_attn_output
+
+
+@xFuserTransformerWrappersRegister.register(QwenImageTransformer2DModel)
+class xFuserQwenImagePipeFusionTransformerWrapper(xFuserTransformerBaseWrapper):
+    """Stage-sliced Qwen-Image transformer used by pipeline wrappers."""
+
+    def __init__(self, transformer: QwenImageTransformer2DModel):
+        for block in transformer.transformer_blocks:
+            block.attn.processor = xFuserQwenDoubleStreamAttnProcessor()
+        super().__init__(
+            transformer=transformer,
+            submodule_name_to_wrap=["attn"],
+            transformer_blocks_name=["transformer_blocks"],
+        )
+        register_fp8_comms_eligible_modules(
+            self, [block.attn for block in self.transformer_blocks]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples=None,
+        additional_t_cond=None,
+        return_dict: bool = True,
+    ):
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+            pipefusion_full_img_shapes = attention_kwargs.pop(
+                "_xdit_pipefusion_full_img_shapes",
+                None,
+            )
+        else:
+            attention_kwargs = {}
+            lora_scale = 1.0
+            pipefusion_full_img_shapes = None
+        if USE_PEFT_BACKEND:
+            scale_lora_layers(self, lora_scale)
+
+        transformer_dtype = next(self.parameters()).dtype
+        hidden_states = hidden_states.to(dtype=transformer_dtype)
+        encoder_hidden_states = encoder_hidden_states.to(
+            dtype=transformer_dtype
+        )
+        if additional_t_cond is not None:
+            additional_t_cond = additional_t_cond.to(
+                dtype=transformer_dtype
+            )
+        if is_pipeline_first_stage():
+            hidden_states = self.img_in(hidden_states)
+            encoder_hidden_states = self.txt_in(self.txt_norm(encoder_hidden_states))
+
+        timestep = timestep.to(hidden_states.dtype)
+        if self.zero_cond_t:
+            raise ValueError("Qwen zero_cond_t is not supported with PipeFusion")
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+        temb = (
+            self.time_text_embed(timestep, hidden_states, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states, additional_t_cond)
+        )
+
+        text_seq_len, _, encoder_hidden_states_mask = (
+            compute_text_seq_len_from_mask(
+                encoder_hidden_states, encoder_hidden_states_mask
+            )
+        )
+        image_rotary_emb = self.pos_embed(
+            pipefusion_full_img_shapes or img_shapes,
+            max_txt_seq_len=text_seq_len,
+            device=hidden_states.device,
+        )
+        if pipefusion_full_img_shapes is not None:
+            image_freqs, text_freqs = image_rotary_emb
+            runtime_state = get_runtime_state()
+            patch_idx = runtime_state.pipeline_patch_idx
+            target_start = (
+                runtime_state.pp_patches_token_start_idx_local[patch_idx]
+            )
+            target_end = (
+                runtime_state.pp_patches_token_start_idx_local[patch_idx + 1]
+            )
+            patch_image_freqs = [image_freqs[target_start:target_end]]
+            reference_start = attention_kwargs.get("reference_patch_start")
+            reference_end = attention_kwargs.get("reference_patch_end")
+            if reference_start is not None and reference_end is not None:
+                target_total = (
+                    runtime_state.pp_patches_token_start_idx_local[-1]
+                )
+                patch_image_freqs.append(
+                    image_freqs[
+                        target_total + reference_start :
+                        target_total + reference_end
+                    ]
+                )
+            image_rotary_emb = (
+                torch.cat(patch_image_freqs, dim=0),
+                text_freqs,
+            )
+        block_attention_kwargs = dict(attention_kwargs)
+        if encoder_hidden_states_mask is not None:
+            image_mask = torch.ones(
+                hidden_states.shape[:2], dtype=torch.bool, device=hidden_states.device
+            )
+            block_attention_kwargs["attention_mask"] = torch.cat(
+                [encoder_hidden_states_mask, image_mask], dim=1
+            )
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=None,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=block_attention_kwargs,
+                modulate_index=None,
+            )
+            if controlnet_block_samples is not None:
+                interval = int(np.ceil(len(self.transformer_blocks) / len(controlnet_block_samples)))
+                hidden_states = hidden_states + controlnet_block_samples[index_block // interval]
+
+        if is_pipeline_last_stage():
+            hidden_states = self.proj_out(self.norm_out(hidden_states, temb))
+            output = (hidden_states, None)
+        else:
+            output = (hidden_states, encoder_hidden_states)
+
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
 
 
 class xFuserQwenImageTransformerWrapper(QwenImageTransformer2DModel):

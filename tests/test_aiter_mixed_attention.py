@@ -5,6 +5,31 @@ import torch
 import torch.nn.functional as F
 
 
+@pytest.mark.parametrize(
+    ("dtype", "query_length", "key_length", "num_heads", "expected"),
+    [
+        (torch.bfloat16, 2560, 2560, 24, True),
+        (torch.bfloat16, 4352, 16640, 24, True),
+        (torch.bfloat16, 2304, 4352, 24, False),
+        (torch.bfloat16, 4096, 256, 24, False),
+        (torch.bfloat16, 2560, 2560, 40, False),
+        (torch.bfloat16, 3584, 3584, 40, True),
+        (torch.float16, 4352, 16640, 24, False),
+    ],
+)
+def test_flydsl_fp8_shape_eligibility(
+    dtype, query_length, key_length, num_heads, expected
+):
+    from xfuser.core.distributed.attention_backend import _flydsl_fp8_eligible
+
+    assert (
+        _flydsl_fp8_eligible(
+            dtype, query_length, key_length, num_heads, head_dim=128
+        )
+        is expected
+    )
+
+
 def test_aiter_bf16_backends_use_mha_v4_while_aiter_remains_mha_v3(monkeypatch):
     from xfuser.core.distributed import attention_backend
 

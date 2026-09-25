@@ -27,6 +27,32 @@ logger = init_logger(__name__)
 ATTENTION_FUNCTION_REGISTRY = {}
 
 
+def _flydsl_fp8_min_seq(head_dim: int, num_heads: int) -> int:
+    # Measured on gfx1201: D64/H38 and D128/H<=32 flip at S~2560;
+    # D128 high head-count (Wan H40) flips at S~3584.
+    if head_dim >= 128 and num_heads > 32:
+        return 3584
+    return 2560
+
+
+def _flydsl_fp8_eligible(
+    dtype: torch.dtype,
+    query_length: int,
+    key_length: int,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    if dtype != torch.bfloat16:
+        return False
+    if query_length < _flydsl_fp8_min_seq(head_dim, num_heads):
+        return False
+    # Ordinary cross-attention has short conditioning K/V and does not
+    # amortize quantization. PipeFusion patch attention has a patch Q against
+    # longer cached image K/V and does: measured gfx1201 end-to-end wins are
+    # 17.5% at Sq=4352, Sk=16640.
+    return query_length == key_length or key_length > query_length
+
+
 @dataclass(frozen=True)
 class _AiterMhaV4Capabilities:
     enabled: bool = False
@@ -495,14 +521,6 @@ if env_info["has_aiter"]:
         # AITER_FLYDSL_FP8 -> xfuser::flydsl_attn_fp8. fp8 is unfused (faster e2e) so it holds fp8
         # Q/K/V alongside the live bf16 Q/K/V -> higher peak VRAM; pick AITER_FLYDSL when tight.
 
-        # fp8 wins only above a seq crossover (quant pre-pass cost vs K/V HBM bytes saved), which
-        # depends on (head_dim, num_heads). Measured on gfx1201: D64/H38 and D128/H<=32 flip at
-        # S~2560; D128 high head-count (wan H40) at S~3584. Below: fp8 loses 7-18%; above: wins <4%.
-        def _flydsl_fp8_min_seq(head_dim: int, num_heads: int) -> int:
-            if head_dim >= 128 and num_heads > 32:
-                return 3584
-            return 2560
-
         def _flydsl_fp8_attn(query, key, value, is_causal):
             # flydsl_fp8_quant returns fp8 q/k/v + descales (real = fp8 * descale).
             qq, kk, vv, sq, sk, sv = flydsl_fp8_quant_aiter(query, key, value, rotation=True)
@@ -555,24 +573,36 @@ if env_info["has_aiter"]:
             value: torch.Tensor,
             is_causal: bool,
         ) -> torch.Tensor:
-            # fp8 only for bf16 self-attn above the crossover; else fall back to the bf16 kernel.
+            # Use fp8 for large self-attention and large patch-Q/full-KV attention.
             B, S_real, H, D = query.shape
-            is_cross = key.shape[1] != S_real
+            key_length = key.shape[1]
+            is_cross = key_length != S_real
             min_seq = _flydsl_fp8_min_seq(D, H)
-            use_fp8 = query.dtype == torch.bfloat16 and not is_cross and S_real >= min_seq
+            use_fp8 = _flydsl_fp8_eligible(query.dtype, S_real, key_length, H, D)
             if use_fp8:
                 msg = (
-                    f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> fp8 (S>={min_seq}) "
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] "
+                    f"-> fp8 (Sq>={min_seq}) "
                     "(fp8 pre-pass adds a transient QKV copy -> higher peak VRAM)"
                 )
-            elif query.dtype == torch.bfloat16 and not is_cross:
-                msg = f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> bf16 (S<{min_seq})"
+            elif (
+                query.dtype == torch.bfloat16
+                and key_length >= S_real
+                and S_real < min_seq
+            ):
+                msg = (
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] "
+                    f"-> bf16 (Sq<{min_seq})"
+                )
             else:
                 msg = (
-                    f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> bf16 "
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] -> bf16 "
                     f"(not fp8-eligible: dtype={query.dtype}, cross={is_cross})"
                 )
-            _flydsl_log_once((B, S_real, H, D, is_cross, query.dtype), msg)
+            _flydsl_log_once(
+                (B, S_real, key_length, H, D, query.dtype),
+                msg,
+            )
             if use_fp8:
                 return _flydsl_fp8_attn(query, key, value, is_causal)
             return flydsl_flash_attn_func_aiter(

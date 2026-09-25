@@ -137,6 +137,8 @@ Individual model classes that inherit from `xFuserModel`:
 | `--ulysses_degree` | Ulysses sequence parallel degree | 1 |
 | `--ring_degree` | Ring sequence parallel degree | 1 |
 | `--pipefusion_parallel_degree` | PipeFusion pipeline stages | 1 |
+| `--num_pipeline_patch` | Number of spatial PipeFusion patches | 1 |
+| `--pipefusion_sync_steps` | Initial synchronous PipeFusion denoising steps | 1 |
 | `--tensor_parallel_degree` | Tensor parallel degree | 1 |
 | `--data_parallel_degree` | Data parallel degree | 1 |
 | `--use_cfg_parallel` | Enable CFG parallel | False |
@@ -285,7 +287,14 @@ fill it from rank 0.
 | Ideogram 4 | Streaming; both the conditional and unconditional transformer declared | None | Both transformers; text encoder loads normally | Yes, for both transformers; the `trust_remote_code` text encoder is filled eagerly because the manifest cannot read its parameter names ahead of the load |
 | MiniMax-H3 and MiniMax-H3-Ref2VA | Modular `ModularPipeline` construction with fused QKV projections; direct load only | None | Rejected before allocation: fusion rewrites attention into `attn.to_qkv`, so live tensor names stop matching checkpoint keys | No |
 
-The FLUX PipeFusion loading branches construct their complete pipelines directly, so they do not use transformer streaming, and replicated meta-load is excluded whenever PipeFusion is active. Each runner keeps class-level `load_support` beside its capabilities and settings. The declaration positively names eligible meta transformers and text encoders and records standard-collective and local-blockwise routes independently; a requested unsupported meta mode fails before model allocation.
+PipeFusion loading branches construct their complete pipelines directly.
+With `--memory_efficient_replicated_load`, supported runners materialize only
+the stage-local transformer blocks from meta tensors; replicated pipeline
+components remain eager. Each runner keeps class-level `load_support` beside
+its capabilities and settings. The declaration positively names eligible meta
+transformers and text encoders and records standard-collective and
+local-blockwise routes independently; an unsupported request fails before
+model allocation.
 
 #### Per-model FP4 and INT8 Targets
 
@@ -322,7 +331,7 @@ list rather than adding to it.
 - Setting `--use_fp8_gemms` and `--use_fp4_gemms` together requires `--use_hybrid_gemm_schedule`; the generic combination is rejected. The hybrid FP4 path owns its FP8 high-precision conversion, so the generic FP8 traversal does not run afterward. Model-selected quality overrides and FP8-only components remain FP8. Use the FP8 precision-override flags only with FP4.
 - `--memory_efficient_sharding` requires `--fully_shard_degree > 1`. It is a sharded load: rank 0 reads one block at a time and broadcasts it within the FSDP group before each rank receives its shard.
 - `--fully_shard_degree` is orthogonal to the parallel degree and does not contribute to it. A multi-rank run must still declare a parallel degree whose product (`data × cfg × sequence × tensor × pipefusion`) equals the DiT parallel size, so pair `--fully_shard_degree N` with, for example, `--ulysses_degree N`. Setting only `--fully_shard_degree` fails config validation before the model is built.
-- `--memory_efficient_replicated_load` is opt-in, requires multiple ranks, and applies only when weights are replicated. It is ignored with FSDP, PipeFusion, or tensor parallelism, and for runners marked “No” above. Pure Ulysses, ring, CFG, and data parallelism remain eligible.
+- `--memory_efficient_replicated_load` is opt-in and requires multiple ranks. With PipeFusion it selects stage-local blockwise meta loading for supported transformers while replicated components remain eager. It is ignored with tensor parallelism and unsupported runners; targeted PipeFusion FSDP may use it for the stage-local transformer while sharding selected replicated components.
 - The two memory-efficient load flags represent different layouts and are not used together: FSDP splits weights, while replicated meta-load gives every rank the same weights.
 - CPU/model offload can be combined with AITER FP8; converted leaves are evicted as they are processed. Other quantization backends first require their block or component on the GPU.
 - `--enable_group_cpu_offload` is rejected with FP4 on the AITER backend, including the hybrid FP8/FP4 mode, because packed FP4 weights survive neither leg of the offload: with `--group_offload_low_cpu_mem` the hook pins each tensor and torch has no `pin_memory` for `Float4_e2m1fn_x2`, and without it AITER binds a device from the parameter it is handed, so a host parameter resolves to an invalid ordinal and aborts the process. Offload at FP8 or bf16, or run FP4 without offload.

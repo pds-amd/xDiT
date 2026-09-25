@@ -32,6 +32,7 @@ from xfuser.core.distributed.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from xfuser.core.distributed import parallel_state
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
@@ -42,7 +43,6 @@ from xfuser.core.distributed import (
     get_runtime_state,
 )
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
-from xfuser.core.distributed.parallel_state import _SP
 from xfuser.envs import PACKAGES_CHECKER
 
 from xfuser.model_executor.layers.usp import USP
@@ -76,8 +76,13 @@ class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
 
     def __init__(self):
         super().__init__()
-        self.use_long_ctx_attn_kvcache = (
-            HAS_LONG_CTX_ATTN and _SP and get_sequence_parallel_world_size() > 1
+
+    @property
+    def use_long_ctx_attn_kvcache(self):
+        return (
+            HAS_LONG_CTX_ATTN
+            and parallel_state._SP is not None
+            and get_sequence_parallel_world_size() > 1
         )
 
     def __call__(
@@ -216,7 +221,12 @@ class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
                 attn_layer=attn,
             )
         else:
-            hidden_states = USP(query, key, value, attn_layer=attn)
+            hidden_states = USP(
+                query,
+                key,
+                value,
+                attn_layer=None if distri_cache_updated else attn,
+            )
 
         # Transpose back to original shape
         hidden_states = hidden_states.transpose(1, 2)
@@ -248,8 +258,13 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
 
     def __init__(self):
         super().__init__()
-        self.use_long_ctx_attn_kvcache = (
-            HAS_LONG_CTX_ATTN and _SP and get_sequence_parallel_world_size() > 1
+
+    @property
+    def use_long_ctx_attn_kvcache(self):
+        return (
+            HAS_LONG_CTX_ATTN
+            and parallel_state._SP is not None
+            and get_sequence_parallel_world_size() > 1
         )
 
     def __call__(
@@ -362,7 +377,11 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
             )
         else:
             hidden_states = USP(
-                query, key, value, combine_qkv_a2a=True, attn_layer=attn
+                query,
+                key,
+                value,
+                combine_qkv_a2a=True,
+                attn_layer=None if distri_cache_updated else attn,
             )
 
         # Transpose back to original shape
@@ -598,9 +617,15 @@ class xFuserFlux2Transformer2DModelWrapper(xFuserTransformerBaseWrapper):
         **kwargs,
     ):
         # 1. timestep embedding + modulation (cheap; depends only on timestep)
-        timestep = timestep.to(hidden_states.dtype) * 1000
+        compute_dtype = next(self.time_guidance_embed.parameters()).dtype
+        hidden_states = hidden_states.to(dtype=compute_dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.to(
+                dtype=compute_dtype
+            )
+        timestep = timestep.to(compute_dtype) * 1000
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance.to(compute_dtype) * 1000
         temb = self.time_guidance_embed(timestep, guidance)
         double_stream_mod_img = self.double_stream_modulation_img(temb)
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)

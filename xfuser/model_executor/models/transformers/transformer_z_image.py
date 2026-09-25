@@ -22,6 +22,16 @@ from xfuser.core.distributed import (
     get_classifier_free_guidance_world_size,
     get_classifier_free_guidance_rank,
     get_cfg_group,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
+from xfuser.core.cache_manager.cache_manager import get_cache_manager
+from xfuser.core.distributed.runtime_state import get_runtime_state
+from xfuser.model_executor.models.transformers.base_transformer import (
+    xFuserTransformerBaseWrapper,
+)
+from xfuser.model_executor.models.transformers.register import (
+    xFuserTransformerWrappersRegister,
 )
 
 ADALN_EMBED_DIM = 256
@@ -80,6 +90,7 @@ class xFuserZSingleStreamAttnProcessor:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
+        latte_temporal_attention: bool = False,
     ) -> torch.Tensor:
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
@@ -144,6 +155,95 @@ class xFuserZSingleStreamAttnProcessor:
         if len(attn.to_out) > 1:  # dropout
             output = attn.to_out[1](output)
 
+        return output
+
+
+class xFuserZImagePipeFusionAttnProcessor(xFuserZSingleStreamAttnProcessor):
+    """Z-Image attention with a full-image stale-KV cache.
+
+    Z-Image's unified stream is ordered ``[image, caption]``. Only image tokens
+    are spatially patched; caption KV is recomputed for every patch.
+    """
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
+        latte_temporal_attention: bool = False,
+    ) -> torch.Tensor:
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+        value = attn.to_v(hidden_states)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+        query, key = flydsl_fused_qk_norm_rope(
+            query, key, attn.norm_q, attn.norm_k, freqs_cis
+        )
+        dtype = query.dtype
+
+        runtime_state = get_runtime_state()
+        image_tokens = int(getattr(attn, "_xfuser_image_tokens", 0))
+        if runtime_state.num_pipeline_patch > 1 and image_tokens > 0:
+            image_key, caption_key = key.split(
+                [image_tokens, key.shape[1] - image_tokens], dim=1
+            )
+            image_value, caption_value = value.split(
+                [image_tokens, value.shape[1] - image_tokens], dim=1
+            )
+            image_key, image_value = get_cache_manager().update_and_get_kv_cache(
+                new_kv=[image_key, image_value],
+                layer=attn,
+                slice_dim=1,
+                layer_type="attn",
+            )
+            key = torch.cat([image_key, caption_key], dim=1)
+            value = torch.cat([image_value, caption_value], dim=1)
+
+            if (
+                attention_mask is not None
+                and attention_mask.ndim == 2
+                and runtime_state.patch_mode
+            ):
+                full_image_tokens = int(
+                    getattr(attn, "_xfuser_full_image_tokens", image_key.shape[1])
+                )
+                # PipeFusion deliberately exposes the whole spatial cache:
+                # earlier stripes contain this step's KV and later stripes
+                # retain the previous step's KV. Masking later stripes would
+                # remove the cross-patch context the algorithm approximates.
+                image_mask = torch.ones(
+                    attention_mask.shape[0],
+                    full_image_tokens,
+                    dtype=torch.bool,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat(
+                    [image_mask, attention_mask[:, image_tokens:]], dim=1
+                )
+
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        hidden_states = USP(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            is_causal=False,
+            attn_layer=None if runtime_state.num_pipeline_patch > 1 else attn,
+        )
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).to(dtype)
+        output = attn.to_out[0](hidden_states)
+        if len(attn.to_out) > 1:
+            output = attn.to_out[1](output)
         return output
 
 
@@ -370,4 +470,277 @@ class xFuserZImageTransformer2DWrapper(ZImageTransformer2DModel):
             return (x,)
 
         return Transformer2DModelOutput(sample=x)
+
+
+@xFuserTransformerWrappersRegister.register(ZImageTransformer2DModel)
+class xFuserZImagePipeFusionTransformerWrapper(xFuserTransformerBaseWrapper):
+    """Stage-sliced Z-Image transformer for PipeFusion.
+
+    Refiner and main block lists form one contiguous pipeline. At context-only
+    boundaries the image and caption states travel as one unified tensor, so
+    the pipeline transport remains a single tensor.
+    """
+
+    transformer_blocks_name = ["noise_refiner", "context_refiner", "layers"]
+
+    def __init__(self, transformer: ZImageTransformer2DModel):
+        for layer in (
+            *transformer.noise_refiner,
+            *transformer.context_refiner,
+            *transformer.layers,
+        ):
+            layer.attention.processor = (
+                xFuserZImagePipeFusionAttnProcessor()
+            )
+        super().__init__(
+            transformer=transformer,
+            submodule_name_to_wrap=[],
+            transformer_blocks_name=self.transformer_blocks_name,
+        )
+        cache_manager = get_cache_manager()
+        for attention in z_image_attn_modules(self):
+            if not cache_manager.has_cache_entry(attention):
+                cache_manager.register_cache_entry(attention, "attn")
+        register_fp8_comms_eligible_modules(self, z_image_attn_modules(self))
+
+    @staticmethod
+    def _starts_at_zero(blocks: torch.nn.ModuleList) -> bool:
+        if not blocks:
+            return False
+        fqn = getattr(blocks[0], "_xfuser_checkpoint_fqn", "")
+        return fqn.endswith(".0")
+
+    @staticmethod
+    def _unify(
+        x,
+        cap_feats,
+        x_freqs,
+        cap_freqs,
+        x_lengths,
+        cap_lengths,
+        device,
+    ):
+        unified = [
+            torch.cat([x[i][:x_lengths[i]], cap_feats[i][:cap_lengths[i]]])
+            for i in range(len(x_lengths))
+        ]
+        unified_freqs = [
+            torch.cat(
+                [x_freqs[i][:x_lengths[i]], cap_freqs[i][:cap_lengths[i]]]
+            )
+            for i in range(len(x_lengths))
+        ]
+        lengths = [a + b for a, b in zip(x_lengths, cap_lengths)]
+        unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
+        unified_freqs = pad_sequence(
+            unified_freqs, batch_first=True, padding_value=0.0
+        )
+        mask = torch.zeros(
+            (len(lengths), max(lengths)), dtype=torch.bool, device=device
+        )
+        for i, length in enumerate(lengths):
+            mask[i, :length] = True
+        return unified, unified_freqs, mask
+
+    @staticmethod
+    def _set_image_token_metadata(
+        blocks, image_tokens: int, full_image_tokens: int
+    ) -> None:
+        for layer in blocks:
+            attention = getattr(layer, "attention", None)
+            if attention is not None:
+                attention._xfuser_image_tokens = image_tokens
+                attention._xfuser_full_image_tokens = full_image_tokens
+                continue
+            cached_blocks = getattr(layer, "transformer_blocks", None)
+            if cached_blocks is not None:
+                xFuserZImagePipeFusionTransformerWrapper._set_image_token_metadata(
+                    cached_blocks, image_tokens, full_image_tokens
+                )
+
+    def forward(
+        self,
+        x: List[torch.Tensor],
+        t,
+        cap_feats: List[torch.Tensor],
+        hidden_states: Optional[torch.Tensor] = None,
+        patch_start_height: int = 0,
+        full_image_tokens: Optional[int] = None,
+        patch_size: int = 2,
+        f_patch_size: int = 1,
+        return_dict: bool = True,
+    ):
+        assert patch_size in self.all_patch_size
+        assert f_patch_size in self.all_f_patch_size
+        device = x[0].device
+        if hidden_states is not None:
+            hidden_states = hidden_states.to(
+                dtype=next(self.parameters()).dtype
+            )
+        t = t.to(device=device, non_blocking=True) * self.t_scale
+        adaln_input = self.t_embedder(t)
+
+        (
+            x_source,
+            cap_source,
+            x_size,
+            x_pos_ids,
+            cap_pos_ids,
+            x_pad_mask,
+            cap_pad_mask,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+        # patchify_and_embed numbers every spatial patch from row zero. Restore
+        # global image-row coordinates so each PipeFusion patch gets the same
+        # RoPE positions as the unsliced image.
+        row_offset = patch_start_height // patch_size
+        if row_offset:
+            for ids, pad_mask in zip(x_pos_ids, x_pad_mask):
+                ids[~pad_mask, 1] += row_offset
+
+        x_lengths = [len(value) for value in x_source]
+        cap_lengths = [len(value) for value in cap_source]
+        x_source = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](
+            torch.cat(x_source, dim=0)
+        )
+        adaln_input = adaln_input.type_as(x_source)
+        x_source = _scatter_pad_token(
+            x_source, torch.cat(x_pad_mask), self.x_pad_token
+        )
+        x_source = pad_sequence(
+            list(x_source.split(x_lengths, dim=0)),
+            batch_first=True,
+            padding_value=0.0,
+        )
+        x_freqs = pad_sequence(
+            list(
+                self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split(
+                    [len(ids) for ids in x_pos_ids], dim=0
+                )
+            ),
+            batch_first=True,
+            padding_value=0.0,
+        )
+        x_mask = torch.zeros(
+            (len(x_lengths), max(x_lengths)), dtype=torch.bool, device=device
+        )
+        for i, length in enumerate(x_lengths):
+            x_mask[i, :length] = True
+
+        cap_source = self.cap_embedder(torch.cat(cap_source, dim=0))
+        cap_source = _scatter_pad_token(
+            cap_source, torch.cat(cap_pad_mask), self.cap_pad_token
+        )
+        cap_source = pad_sequence(
+            list(cap_source.split(cap_lengths, dim=0)),
+            batch_first=True,
+            padding_value=0.0,
+        )
+        cap_freq_chunks = self.rope_embedder(
+            torch.cat(cap_pos_ids, dim=0)
+        ).split([len(ids) for ids in cap_pos_ids], dim=0)
+        cap_freqs = pad_sequence(
+            [
+                frequencies[:length]
+                for frequencies, length in zip(
+                    cap_freq_chunks, cap_lengths
+                )
+            ],
+            batch_first=True,
+            padding_value=0.0,
+        )
+        cap_mask = torch.zeros(
+            (len(cap_lengths), max(cap_lengths)),
+            dtype=torch.bool,
+            device=device,
+        )
+        for i, length in enumerate(cap_lengths):
+            cap_mask[i, :length] = True
+
+        local_image_tokens = x_source.shape[1]
+        full_image_tokens = int(full_image_tokens or local_image_tokens)
+        has_noise = len(self.noise_refiner) > 0
+        has_context = len(self.context_refiner) > 0
+        has_main = len(self.layers) > 0
+
+        unified = unified_freqs = unified_mask = None
+        if is_pipeline_first_stage():
+            x_state = x_source
+            cap_state = cap_source
+        elif has_noise:
+            x_state = hidden_states
+            cap_state = cap_source
+        elif has_context and self._starts_at_zero(self.context_refiner):
+            x_state = hidden_states
+            cap_state = cap_source
+        elif has_context:
+            x_state = hidden_states[:, :local_image_tokens]
+            cap_state = hidden_states[
+                :, local_image_tokens : local_image_tokens + cap_source.shape[1]
+            ]
+        else:
+            unified = hidden_states
+            x_state = cap_state = None
+
+        if has_noise:
+            self._set_image_token_metadata(
+                self.noise_refiner, local_image_tokens, full_image_tokens
+            )
+            for layer in self.noise_refiner:
+                x_state = layer(x_state, x_mask, x_freqs, adaln_input)
+
+        if has_context:
+            self._set_image_token_metadata(self.context_refiner, 0, 0)
+            for layer in self.context_refiner:
+                cap_state = layer(cap_state, cap_mask, cap_freqs)
+
+        if has_context or (has_main and unified is None):
+            unified, unified_freqs, unified_mask = self._unify(
+                x_state,
+                cap_state,
+                x_freqs,
+                cap_freqs,
+                x_lengths,
+                cap_lengths,
+                device,
+            )
+        elif unified is not None:
+            _, unified_freqs, unified_mask = self._unify(
+                x_source,
+                cap_source,
+                x_freqs,
+                cap_freqs,
+                x_lengths,
+                cap_lengths,
+                device,
+            )
+
+        if has_main:
+            self._set_image_token_metadata(
+                self.layers, local_image_tokens, full_image_tokens
+            )
+            for layer in self.layers:
+                unified = layer(
+                    unified, unified_mask, unified_freqs, adaln_input
+                )
+
+        if is_pipeline_last_stage():
+            unified = self.all_final_layer[
+                f"{patch_size}-{f_patch_size}"
+            ](unified, adaln_input)
+            image_states = [
+                value[:x_lengths[i]]
+                for i, value in enumerate(unified.unbind(dim=0))
+            ]
+            output = self.unpatchify(
+                image_states, x_size, patch_size, f_patch_size
+            )
+        elif has_noise and not has_context and not has_main:
+            output = x_state
+        else:
+            output = unified
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
 

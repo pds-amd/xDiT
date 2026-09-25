@@ -85,3 +85,18 @@ def test_an_unquantized_layer_still_says_so():
 
     with pytest.raises(RuntimeError, match="FP8 weight not initialized"):
         layer._gemm_operands(torch.zeros(2, 8, dtype=torch.bfloat16))
+
+
+def test_fp32_activations_use_supported_compute_dtype(monkeypatch):
+    layer = make_quantized_layer()
+    observed = {}
+
+    def fake_gemm(x, weight, scale):
+        observed["dtype"] = x.dtype
+        return torch.zeros(x.shape[0], weight.shape[0], dtype=torch.bfloat16)
+
+    monkeypatch.setattr(torch.ops.xfuser, "fp8_blockscale_gemm", fake_gemm)
+    output = layer(torch.zeros(2, 8, dtype=torch.float32))
+
+    assert observed["dtype"] == torch.bfloat16
+    assert output.dtype == torch.float32

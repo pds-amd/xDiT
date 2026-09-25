@@ -10,6 +10,8 @@ from diffusers.models.transformers.transformer_flux import (
     FluxTransformer2DModel,
     FluxAttnProcessor,
     FluxAttention,
+    FluxTransformerBlock,
+    FluxSingleTransformerBlock,
 )
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.utils import (
@@ -31,11 +33,11 @@ from xfuser.core.distributed import (
     get_classifier_free_guidance_rank,
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
+    get_pipeline_parallel_world_size,
     get_cfg_group,
     get_sp_group,
 )
-from xfuser.core.distributed.parallel_state import _SP
-
+from xfuser.core.distributed import parallel_state
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
 from xfuser.core.distributed.runtime_state import get_runtime_state
 
@@ -123,16 +125,50 @@ def _split_rotary_emb(image_rotary_emb, num_text_tokens: int, num_image_tokens: 
     return txt, img
 
 
+def _update_flux_reference_kv_cache(
+    attn,
+    reference_key,
+    reference_value,
+    *,
+    sequence_dim,
+    reference_start,
+    reference_end,
+):
+    reference_kv = torch.cat([reference_key, reference_value], dim=-1)
+    state = get_runtime_state()
+    if not state.patch_mode:
+        attn._xdit_pipefusion_reference_kv = reference_kv
+    else:
+        cached_reference_kv = getattr(
+            attn, "_xdit_pipefusion_reference_kv", None
+        )
+        if cached_reference_kv is None:
+            raise RuntimeError("Kontext reference KV cache was not initialized")
+        reference_end = (
+            reference_end
+            if reference_end is not None
+            else reference_start + reference_key.shape[sequence_dim]
+        )
+        cached_reference_kv.narrow(
+            sequence_dim,
+            reference_start,
+            reference_end - reference_start,
+        ).copy_(reference_kv)
+        attn._xdit_pipefusion_reference_kv = cached_reference_kv
+    return torch.chunk(attn._xdit_pipefusion_reference_kv, 2, dim=-1)
+
+
 @xFuserAttentionProcessorRegister.register(FluxAttnProcessor)
 class xFuserFluxAttnProcessor(FluxAttnProcessor):
 
     def __init__(self):
         super().__init__()
-        use_long_ctx_attn_kvcache = True
-        self.use_long_ctx_attn_kvcache = (
+
+    @property
+    def use_long_ctx_attn_kvcache(self):
+        return (
             HAS_LONG_CTX_ATTN
-            and use_long_ctx_attn_kvcache
-            and _SP # required for pipeline parallelism
+            and parallel_state._SP is not None
             and get_sequence_parallel_world_size() > 1
         )
 
@@ -143,20 +179,59 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        image_query_only: bool = False,
+        num_txt_tokens: Optional[int] = None,
+        pipefusion_reference_tokens: int = 0,
+        pipefusion_reference_start: int = 0,
+        pipefusion_reference_end: Optional[int] = None,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
-            attn, hidden_states, encoder_hidden_states
-        )
+        if image_query_only:
+            if attn.fused_projections:
+                raise RuntimeError(
+                    "FLUX image-query-only attention requires unfused projections."
+                )
+            if get_sequence_parallel_world_size() != 1:
+                raise RuntimeError(
+                    "FLUX image-query-only attention does not support sequence parallelism."
+                )
+            if encoder_hidden_states is None:
+                if not num_txt_tokens:
+                    raise ValueError(
+                        "num_txt_tokens is required for single-stream image-query-only attention."
+                    )
+                text_hidden_states = hidden_states[:, :num_txt_tokens]
+                image_hidden_states = hidden_states[:, num_txt_tokens:]
+                query = attn.to_q(image_hidden_states)
+                key = attn.to_k(image_hidden_states)
+                value = attn.to_v(image_hidden_states)
+                encoder_query = None
+                encoder_key = attn.to_k(text_hidden_states)
+                encoder_value = attn.to_v(text_hidden_states)
+            else:
+                query = attn.to_q(hidden_states)
+                key = attn.to_k(hidden_states)
+                value = attn.to_v(hidden_states)
+                encoder_query = None
+                encoder_key = attn.add_k_proj(encoder_hidden_states)
+                encoder_value = attn.add_v_proj(encoder_hidden_states)
+        else:
+            query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+                attn, hidden_states, encoder_hidden_states
+            )
         query = query.unflatten(-1, (attn.heads, -1))
         key = key.unflatten(-1, (attn.heads, -1))
         value = value.unflatten(-1, (attn.heads, -1))
-
-        if attn.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+        if image_query_only and attn.added_kv_proj_dim is None:
             encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
 
-            num_encoder_hidden_states_tokens = encoder_query.shape[1]
+        if attn.added_kv_proj_dim is not None:
+            if encoder_query is not None:
+                encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            num_encoder_hidden_states_tokens = encoder_key.shape[1]
             num_query_tokens = query.shape[1]
 
             if _HAS_FLYDSL:
@@ -167,18 +242,28 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
                 txt_rope, img_rope = _split_rotary_emb(
                     image_rotary_emb, num_encoder_hidden_states_tokens, num_query_tokens
                 )
-                encoder_query, encoder_key = flydsl_fused_qk_norm_rope(
-                    encoder_query,
-                    encoder_key,
-                    attn.norm_added_q,
-                    attn.norm_added_k,
-                    txt_rope,
-                )
+                if image_query_only:
+                    _, encoder_key = flydsl_fused_qk_norm_rope(
+                        encoder_key,
+                        encoder_key,
+                        None,
+                        attn.norm_added_k,
+                        txt_rope,
+                    )
+                else:
+                    encoder_query, encoder_key = flydsl_fused_qk_norm_rope(
+                        encoder_query,
+                        encoder_key,
+                        attn.norm_added_q,
+                        attn.norm_added_k,
+                        txt_rope,
+                    )
                 query, key = flydsl_fused_qk_norm_rope(
                     query, key, attn.norm_q, attn.norm_k, img_rope
                 )
 
-                query = torch.cat([encoder_query, query], dim=1)
+                if not image_query_only:
+                    query = torch.cat([encoder_query, query], dim=1)
                 key = torch.cat([encoder_key, key], dim=1)
                 value = torch.cat([encoder_value, value], dim=1)
 
@@ -192,30 +277,80 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
                 # on the joint stream), unchanged from before the fused kernel.
                 query = attn.norm_q(query)
                 key = attn.norm_k(key)
-                encoder_query = attn.norm_added_q(encoder_query)
                 encoder_key = attn.norm_added_k(encoder_key)
+                if not image_query_only:
+                    encoder_query = attn.norm_added_q(encoder_query)
 
-                query = torch.cat([encoder_query, query], dim=1)
+                if image_query_only:
+                    txt_rope, img_rope = _split_rotary_emb(
+                        image_rotary_emb,
+                        num_encoder_hidden_states_tokens,
+                        num_query_tokens,
+                    )
+                    query = apply_rotary_emb(query, img_rope, sequence_dim=1)
+                    key = apply_rotary_emb(key, img_rope, sequence_dim=1)
+                    encoder_key = apply_rotary_emb(
+                        encoder_key, txt_rope, sequence_dim=1
+                    )
+                else:
+                    query = torch.cat([encoder_query, query], dim=1)
+                    if image_rotary_emb is not None:
+                        query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
                 key = torch.cat([encoder_key, key], dim=1)
                 value = torch.cat([encoder_value, value], dim=1)
-
-                if image_rotary_emb is not None:
-                    query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                if image_rotary_emb is not None and not image_query_only:
                     key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
         else:
             num_encoder_hidden_states_tokens = (
-                get_runtime_state().max_condition_sequence_length
+                num_txt_tokens
+                if image_query_only
+                else get_runtime_state().max_condition_sequence_length
             )
-            num_query_tokens = query.shape[1] - num_encoder_hidden_states_tokens
+            num_query_tokens = query.shape[1]
+            if not image_query_only:
+                num_query_tokens -= num_encoder_hidden_states_tokens
             if _HAS_FLYDSL:
-                query, key = flydsl_fused_qk_norm_rope(
-                    query, key, attn.norm_q, attn.norm_k, image_rotary_emb
-                )
+                if image_query_only:
+                    txt_rope, img_rope = _split_rotary_emb(
+                        image_rotary_emb,
+                        num_encoder_hidden_states_tokens,
+                        num_query_tokens,
+                    )
+                    query, key = flydsl_fused_qk_norm_rope(
+                        query, key, attn.norm_q, attn.norm_k, img_rope
+                    )
+                    _, encoder_key = flydsl_fused_qk_norm_rope(
+                        encoder_key,
+                        encoder_key,
+                        None,
+                        attn.norm_k,
+                        txt_rope,
+                    )
+                    key = torch.cat([encoder_key, key], dim=1)
+                    value = torch.cat([encoder_value, value], dim=1)
+                else:
+                    query, key = flydsl_fused_qk_norm_rope(
+                        query, key, attn.norm_q, attn.norm_k, image_rotary_emb
+                    )
             else:
                 query = attn.norm_q(query)
                 key = attn.norm_k(key)
-                if image_rotary_emb is not None:
+                if image_query_only:
+                    encoder_key = attn.norm_k(encoder_key)
+                    txt_rope, img_rope = _split_rotary_emb(
+                        image_rotary_emb,
+                        num_encoder_hidden_states_tokens,
+                        num_query_tokens,
+                    )
+                    query = apply_rotary_emb(query, img_rope, sequence_dim=1)
+                    key = apply_rotary_emb(key, img_rope, sequence_dim=1)
+                    encoder_key = apply_rotary_emb(
+                        encoder_key, txt_rope, sequence_dim=1
+                    )
+                    key = torch.cat([encoder_key, key], dim=1)
+                    value = torch.cat([encoder_value, value], dim=1)
+                elif image_rotary_emb is not None:
                     query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
                     key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
 
@@ -230,12 +365,34 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
             encoder_hidden_states_value_proj, value = value.split(
                 [num_encoder_hidden_states_tokens, num_query_tokens], dim=1
             )
+            reference_key = reference_value = None
+            if pipefusion_reference_tokens:
+                target_tokens = key.shape[1] - pipefusion_reference_tokens
+                key, reference_key = key.split(
+                    [target_tokens, pipefusion_reference_tokens], dim=1
+                )
+                value, reference_value = value.split(
+                    [target_tokens, pipefusion_reference_tokens], dim=1
+                )
             key, value = get_cache_manager().update_and_get_kv_cache(
                 new_kv=[key, value],
                 layer=attn,
                 slice_dim=1,
                 layer_type="attn",
             )
+            if reference_key is not None:
+                reference_key, reference_value = (
+                    _update_flux_reference_kv_cache(
+                        attn,
+                        reference_key,
+                        reference_value,
+                        sequence_dim=1,
+                        reference_start=pipefusion_reference_start,
+                        reference_end=pipefusion_reference_end,
+                    )
+                )
+                key = torch.cat([key, reference_key], dim=1)
+                value = torch.cat([value, reference_value], dim=1)
             key = torch.cat([encoder_hidden_states_key_proj, key], dim=1)
             value = torch.cat([encoder_hidden_states_value_proj, value], dim=1)
             distri_cache_updated = True
@@ -251,7 +408,19 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
             )
             hidden_states = hidden_states.transpose(1, 2)
         else:
-            if get_runtime_state().split_text_embed_in_sp:
+            if image_query_only:
+                hidden_states = USP(
+                    query,
+                    key,
+                    value,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    combine_qkv_a2a=True,
+                    attn_layer=None if distri_cache_updated else attn,
+                    head_balance_layer=attn,
+                )
+                hidden_states = hidden_states.transpose(1, 2)
+            elif get_runtime_state().split_text_embed_in_sp:
                 encoder_hidden_states_query_proj = None
                 encoder_hidden_states_key_proj = None
                 encoder_hidden_states_value_proj = None
@@ -267,27 +436,56 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
                 encoder_hidden_states_value_proj, value = value.split(
                     [num_encoder_hidden_states_tokens, num_query_tokens_kv], dim=2
                 )
-            hidden_states = USP(
-                query,
-                key,
-                value,
-                dropout_p=0.0,
-                is_causal=False,
-                combine_qkv_a2a=True,
-                joint_query=encoder_hidden_states_query_proj,
-                joint_key=encoder_hidden_states_key_proj,
-                joint_value=encoder_hidden_states_value_proj,
-                joint_strategy="front",
-                attn_layer=None if distri_cache_updated else attn,
-                head_balance_layer=attn,
-            )
-            hidden_states = hidden_states.transpose(1, 2)
+                if (
+                    self.use_long_ctx_attn_kvcache
+                    and pipefusion_reference_tokens
+                ):
+                    target_tokens = key.shape[2] - pipefusion_reference_tokens
+                    key, reference_key = key.split(
+                        [target_tokens, pipefusion_reference_tokens], dim=2
+                    )
+                    value, reference_value = value.split(
+                        [target_tokens, pipefusion_reference_tokens], dim=2
+                    )
+                    reference_key, reference_value = (
+                        _update_flux_reference_kv_cache(
+                            attn,
+                            reference_key,
+                            reference_value,
+                            sequence_dim=2,
+                            reference_start=pipefusion_reference_start,
+                            reference_end=pipefusion_reference_end,
+                        )
+                    )
+                    encoder_hidden_states_key_proj = torch.cat(
+                        [encoder_hidden_states_key_proj, reference_key], dim=2
+                    )
+                    encoder_hidden_states_value_proj = torch.cat(
+                        [encoder_hidden_states_value_proj, reference_value],
+                        dim=2,
+                    )
+            if not image_query_only:
+                hidden_states = USP(
+                    query,
+                    key,
+                    value,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    combine_qkv_a2a=True,
+                    joint_query=encoder_hidden_states_query_proj,
+                    joint_key=encoder_hidden_states_key_proj,
+                    joint_value=encoder_hidden_states_value_proj,
+                    joint_strategy="front",
+                    attn_layer=None if distri_cache_updated else attn,
+                    head_balance_layer=attn,
+                )
+                hidden_states = hidden_states.transpose(1, 2)
 
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
-        if encoder_hidden_states is not None:
+        if encoder_hidden_states is not None and not image_query_only:
             encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
                 [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
@@ -297,6 +495,9 @@ class xFuserFluxAttnProcessor(FluxAttnProcessor):
 
             return hidden_states, encoder_hidden_states
         else:
+            if image_query_only and encoder_hidden_states is not None:
+                hidden_states = attn.to_out[0](hidden_states)
+                hidden_states = attn.to_out[1](hidden_states)
             return hidden_states
 
 
@@ -315,6 +516,154 @@ def flux_attn_modules(transformer) -> list[torch.nn.Module]:
             *transformer.single_transformer_blocks,
         )
     ]
+
+
+def _can_use_flux_image_query_only(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: Optional[torch.Tensor],
+    image_rotary_emb,
+    joint_attention_kwargs: Optional[Dict[str, Any]],
+) -> bool:
+    """Whether a later PipeFusion patch can safely omit FLUX text outputs."""
+    state = get_runtime_state()
+    image_only_disabled = getattr(
+        getattr(state, "runtime_config", None),
+        "disable_pipefusion_image_query_only",
+        False,
+    )
+    if (
+        image_only_disabled
+        or block.training
+        or not state.patch_mode
+        or state.pipeline_patch_idx == 0
+        or state.num_pipeline_patch <= 1
+        or get_pipeline_parallel_world_size() <= 1
+        or get_sequence_parallel_world_size() != 1
+        or encoder_hidden_states is None
+        or joint_attention_kwargs
+    ):
+        return False
+
+    attn = block.attn
+    if getattr(attn, "fused_projections", False):
+        return False
+    if not isinstance(image_rotary_emb, (tuple, list)) or len(image_rotary_emb) != 2:
+        return False
+    cos, sin = image_rotary_emb
+    return (
+        isinstance(cos, torch.Tensor)
+        and isinstance(sin, torch.Tensor)
+        and cos.dim() == 2
+        and cos.shape == sin.shape
+        and cos.shape[0]
+        == encoder_hidden_states.shape[1] + hidden_states.shape[1]
+    )
+
+
+def _register_pipefusion_reference_buffers(module: nn.Module) -> None:
+    for attention in flux_attn_modules(module):
+        if "_xdit_pipefusion_reference_kv" not in attention._buffers:
+            attention.register_buffer(
+                "_xdit_pipefusion_reference_kv",
+                None,
+                persistent=False,
+            )
+
+
+def _flux_double_block_image_query_only(
+    block: FluxTransformerBlock,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    image_rotary_emb,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.norm1(
+        hidden_states, emb=temb
+    )
+    norm_encoder_hidden_states = block.norm1_context(
+        encoder_hidden_states, emb=temb
+    )[0]
+    attn_output = block.attn(
+        hidden_states=norm_hidden_states,
+        encoder_hidden_states=norm_encoder_hidden_states,
+        image_rotary_emb=image_rotary_emb,
+        image_query_only=True,
+    )
+    hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
+    norm_hidden_states = block.norm2(hidden_states)
+    norm_hidden_states = (
+        norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+    )
+    hidden_states = (
+        hidden_states
+        + gate_mlp.unsqueeze(1) * block.ff(norm_hidden_states)
+    )
+    return encoder_hidden_states, hidden_states
+
+
+def _flux_single_block_image_query_only(
+    block: FluxSingleTransformerBlock,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    image_rotary_emb,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_txt_tokens = encoder_hidden_states.shape[1]
+    joint_hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+    norm_hidden_states, gate = block.norm(joint_hidden_states, emb=temb)
+    image_norm_hidden_states = norm_hidden_states[:, num_txt_tokens:]
+    mlp_hidden_states = block.act_mlp(block.proj_mlp(image_norm_hidden_states))
+    attn_output = block.attn(
+        hidden_states=norm_hidden_states,
+        image_rotary_emb=image_rotary_emb,
+        image_query_only=True,
+        num_txt_tokens=num_txt_tokens,
+    )
+    update = block.proj_out(torch.cat([attn_output, mlp_hidden_states], dim=2))
+    hidden_states = hidden_states + gate.unsqueeze(1) * update
+    if hidden_states.dtype == torch.float16:
+        hidden_states = hidden_states.clip(-65504, 65504)
+    return encoder_hidden_states, hidden_states
+
+
+def _flux_block_forward(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    image_rotary_emb,
+    joint_attention_kwargs: Optional[Dict[str, Any]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _can_use_flux_image_query_only(
+        block,
+        hidden_states,
+        encoder_hidden_states,
+        image_rotary_emb,
+        joint_attention_kwargs,
+    ):
+        return block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+    if isinstance(block, FluxTransformerBlock):
+        return _flux_double_block_image_query_only(
+            block, hidden_states, encoder_hidden_states, temb, image_rotary_emb
+        )
+    if isinstance(block, FluxSingleTransformerBlock):
+        return _flux_single_block_image_query_only(
+            block, hidden_states, encoder_hidden_states, temb, image_rotary_emb
+        )
+    return block(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        image_rotary_emb=image_rotary_emb,
+        joint_attention_kwargs=joint_attention_kwargs,
+    )
 
 
 class xFuserFlux1Transformer2DWrapper(FluxTransformer2DModel):
@@ -349,6 +698,7 @@ class xFuserFlux1Transformer2DWrapper(FluxTransformer2DModel):
 
         for block in self.transformer_blocks + self.single_transformer_blocks:
             block.attn.processor = xFuserFluxAttnProcessor()
+        _register_pipefusion_reference_buffers(self)
         register_fp8_comms_eligible_modules(self, flux_attn_modules(self))
 
     def pad_to_sp_divisible(self, tensor: torch.Tensor, padding_length: int, dim: int) -> torch.Tensor:
@@ -448,8 +798,12 @@ class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
             transformer_blocks_name=["transformer_blocks", "single_transformer_blocks"],
         )
         self.encoder_hidden_states_cache = [
-            None for _ in range(len(self.transformer_blocks))
+            None
+            for _ in range(
+                len(self.transformer_blocks) + len(self.single_transformer_blocks)
+            )
         ]
+        _register_pipefusion_reference_buffers(self)
         register_fp8_comms_eligible_modules(self, flux_attn_modules(self))
 
     def forward(
@@ -567,12 +921,49 @@ class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
                 )
 
             else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                state = get_runtime_state()
+                if (
+                    not block.training
+                    and state.patch_mode
+                    and state.pipeline_patch_idx == 0
+                ):
+                    self.encoder_hidden_states_cache[index_block] = (
+                        encoder_hidden_states
+                    )
+                cached_encoder_hidden_states = self.encoder_hidden_states_cache[
+                    index_block
+                ]
+                block_encoder_hidden_states = (
+                    cached_encoder_hidden_states
+                    if (
+                        not block.training
+                        and state.patch_mode
+                        and state.pipeline_patch_idx > 0
+                        and cached_encoder_hidden_states is not None
+                    )
+                    else encoder_hidden_states
                 )
+                if (
+                    state.patch_mode
+                    and state.pipeline_patch_idx > 0
+                    and cached_encoder_hidden_states is None
+                ):
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=block_encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+                else:
+                    encoder_hidden_states, hidden_states = _flux_block_forward(
+                        block,
+                        hidden_states,
+                        block_encoder_hidden_states,
+                        temb,
+                        image_rotary_emb,
+                        joint_attention_kwargs,
+                    )
 
             # controlnet residual
             # if controlnet_block_samples is not None:
@@ -583,6 +974,7 @@ class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
         # if self.stage_info.after_flags["transformer_blocks"]:
 
         for index_block, block in enumerate(self.single_transformer_blocks):
+            cache_index = len(self.transformer_blocks) + index_block
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
@@ -607,12 +999,49 @@ class xFuserFluxTransformer2DWrapper(xFuserTransformerBaseWrapper):
                 )
 
             else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
+                state = get_runtime_state()
+                if (
+                    not block.training
+                    and state.patch_mode
+                    and state.pipeline_patch_idx == 0
+                ):
+                    self.encoder_hidden_states_cache[cache_index] = (
+                        encoder_hidden_states
+                    )
+                cached_encoder_hidden_states = self.encoder_hidden_states_cache[
+                    cache_index
+                ]
+                block_encoder_hidden_states = (
+                    cached_encoder_hidden_states
+                    if (
+                        not block.training
+                        and state.patch_mode
+                        and state.pipeline_patch_idx > 0
+                        and cached_encoder_hidden_states is not None
+                    )
+                    else encoder_hidden_states
                 )
+                if (
+                    state.patch_mode
+                    and state.pipeline_patch_idx > 0
+                    and cached_encoder_hidden_states is None
+                ):
+                    encoder_hidden_states, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=block_encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
+                else:
+                    encoder_hidden_states, hidden_states = _flux_block_forward(
+                        block,
+                        hidden_states,
+                        block_encoder_hidden_states,
+                        temb,
+                        image_rotary_emb,
+                        joint_attention_kwargs,
+                    )
 
             # controlnet residual
             # if controlnet_single_block_samples is not None:

@@ -37,6 +37,8 @@ class xFuserQwenImageEditModel(xFuserModel):
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
+        pipefusion_parallel_degree=True,
+        use_cfg_parallel=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
         use_fp8_text_encoder=True,
@@ -51,6 +53,7 @@ class xFuserQwenImageEditModel(xFuserModel):
         num_inference_steps=50,
         guidance_scale=4.0,
         negative_prompt=" ",
+        max_sequence_length=512,
     )
     settings = ModelSettings(
         model_name="Qwen/Qwen-Image-Edit",
@@ -87,20 +90,62 @@ class xFuserQwenImageEditModel(xFuserModel):
             self.settings.output_name = "qwen_image_edit_2509"
 
     def _load_model(self) -> DiffusionPipeline:
-        from diffusers import QwenImageEditPipeline
-        from xfuser.model_executor.models.transformers.transformer_qwen import (
-            xFuserQwenImageTransformerWrapper,
-        )
+        # Qwen-Image is trained for BF16 and overflows in FP16. Keep the
+        # PipeFusion model and its P2P receive buffers in the same safe dtype.
+        self.engine_config.runtime_config.dtype = torch.bfloat16
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_qwenimage import (
+                QwenImageTransformer2DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_qwen_image import (
+                xFuserQwenImageEditPipeline,
+            )
 
-        transformer = self.loader.load_transformer(xFuserQwenImageTransformerWrapper)
-        te_kwargs, te_quant = self.loader.plan_text_encoders()
-        pipe = QwenImageEditPipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            transformer=transformer,
-            torch_dtype=torch.bfloat16,
-            quantization_config=te_quant,
-            **te_kwargs,
-        )
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    QwenImageTransformer2DModel
+                )
+            )
+            pipe = xFuserQwenImageEditPipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=self.engine_config.runtime_config.dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+        else:
+            from diffusers import QwenImageEditPipeline
+            from xfuser.model_executor.pipelines.pipeline_qwen_image import (
+                xFuserQwenImageEditPipeline,
+            )
+            from xfuser.model_executor.models.transformers.transformer_qwen import (
+                xFuserQwenImageTransformerWrapper,
+            )
+
+            transformer = self.loader.load_transformer(
+                xFuserQwenImageTransformerWrapper
+            )
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
+            pipe = QwenImageEditPipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                transformer=transformer,
+                torch_dtype=torch.bfloat16,
+                quantization_config=te_quant,
+                **te_kwargs,
+            )
+            # The stock Diffusers pipeline evaluates both true-CFG branches on
+            # every rank, so merely creating CFG process groups does not provide
+            # CFG parallelism. Use the xFuser denoising loop whenever CFG
+            # parallelism is requested; it assigns one branch per CFG rank and
+            # gathers only the final noise predictions.
+            if self.config.use_cfg_parallel:
+                pipe = xFuserQwenImageEditPipeline(
+                    pipe,
+                    self.engine_config,
+                )
         return pipe
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
@@ -111,17 +156,27 @@ class xFuserQwenImageEditModel(xFuserModel):
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
             "generator": self._make_generator(input_args["seed"]),
+            "max_sequence_length": input_args["max_sequence_length"],
         }
         if "height" in input_args: kwargs["height"] = input_args["height"]
         if "width" in input_args: kwargs["width"] = input_args["width"]
 
         output = self.pipe(**kwargs)
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(
+            images=output.images if output else [], pipe_args=input_args
+        )
 
 
     def _validate_args(self, input_args: dict) -> None:
         """ Validate input arguments """
         super()._validate_args(input_args)
+        if self.config.pipefusion_parallel_degree > 1 and (
+            self.config.ulysses_degree > 1 or self.config.ring_degree > 1
+        ):
+            raise ValueError(
+                "Qwen-Image PipeFusion cannot currently be combined with "
+                "Ulysses or Ring sequence parallelism."
+            )
         images = input_args.get("input_images", [])
         if len(images) != 1:
             raise ValueError("Exactly one input image is required for Qwen Image Edit model.")
@@ -142,6 +197,8 @@ class xFuserQwenImageModel(xFuserModel):
     capabilities = ModelCapabilities(
         ulysses_degree=True,
         ring_degree=True,
+        pipefusion_parallel_degree=True,
+        use_cfg_parallel=True,
         fully_shard_degree=True,
         use_fp8_gemms=True,
         supports_step_caching=True,
@@ -156,6 +213,7 @@ class xFuserQwenImageModel(xFuserModel):
         width=1664,
         num_inference_steps=50,
         guidance_scale=0.0,
+        max_sequence_length=512,
     )
     settings = ModelSettings(
         model_name="Qwen/Qwen-Image",
@@ -188,20 +246,49 @@ class xFuserQwenImageModel(xFuserModel):
             self.settings.output_name = "qwen_image_2512"
 
     def _load_model(self) -> DiffusionPipeline:
-        from diffusers import QwenImagePipeline
-        from xfuser.model_executor.models.transformers.transformer_qwen import (
-            xFuserQwenImageTransformerWrapper,
-        )
+        # Qwen-Image is trained for BF16 and overflows in FP16. Keep the
+        # PipeFusion model and its P2P receive buffers in the same safe dtype.
+        self.engine_config.runtime_config.dtype = torch.bfloat16
+        if self.config.pipefusion_parallel_degree > 1:
+            from diffusers.models.transformers.transformer_qwenimage import (
+                QwenImageTransformer2DModel,
+            )
+            from xfuser.model_executor.pipelines.pipeline_qwen_image import (
+                xFuserQwenImagePipeline,
+            )
 
-        transformer = self.loader.load_transformer(xFuserQwenImageTransformerWrapper)
-        te_kwargs, te_quant = self.loader.plan_text_encoders()
-        pipe = QwenImagePipeline.from_pretrained(
-            pretrained_model_name_or_path=self.settings.model_name,
-            transformer=transformer,
-            torch_dtype=torch.bfloat16,
-            quantization_config=te_quant,
-            **te_kwargs,
-        )
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    QwenImageTransformer2DModel
+                )
+            )
+            pipe = xFuserQwenImagePipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                torch_dtype=self.engine_config.runtime_config.dtype,
+                engine_config=self.engine_config,
+                **pipeline_kwargs,
+            )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
+        else:
+            from diffusers import QwenImagePipeline
+            from xfuser.model_executor.models.transformers.transformer_qwen import (
+                xFuserQwenImageTransformerWrapper,
+            )
+
+            transformer = self.loader.load_transformer(
+                xFuserQwenImageTransformerWrapper
+            )
+            te_kwargs, te_quant = self.loader.plan_text_encoders()
+            pipe = QwenImagePipeline.from_pretrained(
+                pretrained_model_name_or_path=self.settings.model_name,
+                transformer=transformer,
+                torch_dtype=torch.bfloat16,
+                quantization_config=te_quant,
+                **te_kwargs,
+            )
         return pipe
 
     def _run_pipe(self, input_args: dict) -> DiffusionOutput:
@@ -213,7 +300,20 @@ class xFuserQwenImageModel(xFuserModel):
             "num_inference_steps": input_args["num_inference_steps"],
             "true_cfg_scale": input_args["guidance_scale"],
             "generator": self._make_generator(input_args["seed"]),
+            "max_sequence_length": input_args["max_sequence_length"],
         }
 
         output = self.pipe(**kwargs)
-        return DiffusionOutput(images=output.images, pipe_args=input_args)
+        return DiffusionOutput(
+            images=output.images if output else [], pipe_args=input_args
+        )
+
+    def _validate_args(self, input_args: dict) -> None:
+        super()._validate_args(input_args)
+        if self.config.pipefusion_parallel_degree > 1 and (
+            self.config.ulysses_degree > 1 or self.config.ring_degree > 1
+        ):
+            raise ValueError(
+                "Qwen-Image PipeFusion cannot currently be combined with "
+                "Ulysses or Ring sequence parallelism."
+            )

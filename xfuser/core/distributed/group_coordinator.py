@@ -11,6 +11,7 @@ import torch
 import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
+from torch.profiler import record_function
 
 try:
     import torch_musa
@@ -956,7 +957,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
             len(self.receiving_tasks) > 0
         ), "No tasks to receive, call add_pipeline_recv_task first"
         receiving_task = self.receiving_tasks.pop(0)
-        receiving_task[0].wait()
+        with record_function("xdit::pipeline_recv_wait"):
+            receiving_task[0].wait()
         assert (
             receiving_task[1] == name and receiving_task[2] == idx
         ), "Received tensor does not match the requested"

@@ -124,6 +124,9 @@ class xFuserAttentionProcessorRegister:
 
     @classmethod
     def get_processor(cls, processor):
+        exact = cls._XFUSER_ATTENTION_PROCESSOR_MAPPING.get(type(processor))
+        if exact is not None:
+            return exact
         for (
             origin_processor_class,
             xfuser_processor,
@@ -385,6 +388,7 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
         hidden_states: torch.FloatTensor,
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        image_query_only: bool = False,
         *args,
         **kwargs,
     ) -> torch.FloatTensor:
@@ -416,14 +420,19 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
 
         # `context` projections.
         if encoder_hidden_states is not None:
-            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
+            encoder_hidden_states_query_proj = (
+                None
+                if image_query_only
+                else attn.add_q_proj(encoder_hidden_states)
+            )
             encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
             encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-            encoder_hidden_states_query_proj = (
-                encoder_hidden_states_query_proj.view(
-                    batch_size, -1, attn.heads, head_dim
+            if encoder_hidden_states_query_proj is not None:
+                encoder_hidden_states_query_proj = (
+                    encoder_hidden_states_query_proj.view(
+                        batch_size, -1, attn.heads, head_dim
+                    )
                 )
-            )
             encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
                 batch_size, -1, attn.heads, head_dim
             )
@@ -432,7 +441,10 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
                     batch_size, -1, attn.heads, head_dim
                 )
             )
-            if attn.norm_added_q is not None:
+            if (
+                encoder_hidden_states_query_proj is not None
+                and attn.norm_added_q is not None
+            ):
                 encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
             if attn.norm_added_k is not None:
                 encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
@@ -462,6 +474,10 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
 
         #! ---------------------------------------- ATTENTION ----------------------------------------
         if HAS_LONG_CTX_ATTN and get_sequence_parallel_world_size() > 1:
+            if image_query_only:
+                raise RuntimeError(
+                    "SD3 image-query-only attention does not support sequence parallelism."
+                )
             attention_kwargs = None
             if encoder_hidden_states is not None:
                 if get_runtime_state().split_text_embed_in_sp:
@@ -519,9 +535,16 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
 
         else:
             if encoder_hidden_states is not None:
-                query = torch.cat([query, encoder_hidden_states_query_proj], dim=1)
-                key = torch.cat([key, encoder_hidden_states_key_proj], dim=1)
-                value = torch.cat([value, encoder_hidden_states_value_proj], dim=1)
+                if encoder_hidden_states_query_proj is not None:
+                    encoder_hidden_states_query_proj = (
+                        encoder_hidden_states_query_proj.transpose(1, 2)
+                    )
+                encoder_hidden_states_key_proj = (
+                    encoder_hidden_states_key_proj.transpose(1, 2)
+                )
+                encoder_hidden_states_value_proj = (
+                    encoder_hidden_states_value_proj.transpose(1, 2)
+                )
 
             query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
             key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
@@ -533,7 +556,17 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
                 value,
                 dropout_p=0.0,
                 is_causal=False,
-                attn_layer=attn,
+                joint_query=encoder_hidden_states_query_proj,
+                joint_key=encoder_hidden_states_key_proj,
+                joint_value=encoder_hidden_states_value_proj,
+                joint_strategy=(
+                    "rear" if encoder_hidden_states is not None else None
+                ),
+                # The non-long-context path already updated this layer's
+                # spatial KV cache before reshaping. Passing it again would
+                # apply the same patch twice to the now full-length cache.
+                attn_layer=None,
+                attention_kwargs=None,
             )
 
             hidden_states = hidden_states.transpose(1, 2)
@@ -552,7 +585,7 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
         hidden_states = hidden_states.to(query.dtype)
 
         # Split the attention outputs.
-        if encoder_hidden_states is not None:
+        if encoder_hidden_states is not None and not image_query_only:
             hidden_states, encoder_hidden_states = (
                 hidden_states[:, : residual.shape[1]],
                 hidden_states[:, residual.shape[1] :],
@@ -570,7 +603,7 @@ class xFuserJointAttnProcessor2_0(JointAttnProcessor2_0):
                 batch_size, channel, height, width
             )
 
-        if encoder_hidden_states is not None:
+        if encoder_hidden_states is not None and not image_query_only:
             if context_input_ndim == 4:
                 encoder_hidden_states = encoder_hidden_states.transpose(-1, -2).reshape(
                     batch_size, channel, height, width
