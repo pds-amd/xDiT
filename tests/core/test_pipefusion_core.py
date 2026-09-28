@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from xfuser.model_executor.pipefusion import (
     CombinedTensorPayloadCodec,
     PipeFusionAsyncDriver,
+    PipeFusionImagePatchSchedule,
     PipeFusionPatchLayout,
     PipeFusionStageOutputCache,
     PipeFusionStagePayload,
@@ -223,6 +224,48 @@ def test_async_driver_rejects_a_mask_that_does_not_match_timesteps():
 
     with pytest.raises(ValueError, match="computation mask length"):
         driver.run((1,))
+
+
+def test_image_patch_schedule_reuses_patch_zero_condition_state():
+    layout = PipeFusionPatchLayout(
+        split_dim=1,
+        split_sizes=(1, 1),
+        token_counts=(1, 1),
+    )
+    first_payload = torch.tensor([[[10.0], [20.0]]])
+    second_payload = torch.tensor([[[11.0], [99.0]]])
+    group = _FakeGroup([first_payload, second_payload])
+    seen_conditions = []
+    patches = [None, None]
+    schedule = PipeFusionImagePatchSchedule(
+        patch_latents=patches,
+        layout=layout,
+        initial_condition=torch.zeros(1, 1, 1),
+        first_stage=False,
+        last_stage=False,
+        condition_reuse=True,
+        forward_patch_fn=lambda _work, _time, image, condition: (
+            image + 1,
+            seen_conditions.append(condition.clone()) or condition + 1,
+        ),
+        update_last_patch_fn=lambda _work, _time, image, _previous: image,
+        finalize_fn=lambda: "done",
+        model_name="test",
+    )
+
+    assert schedule.run(
+        timesteps=(1,),
+        output_cache=PipeFusionStageOutputCache((1,), 2),
+        transport=PipeFusionTransport(
+            group,
+            first_stage=False,
+            num_steps=1,
+            num_patches=2,
+        ),
+        advance_patch=lambda: None,
+    ) == "done"
+    assert torch.equal(seen_conditions[0], torch.tensor([[[20.0]]]))
+    assert torch.equal(seen_conditions[1], torch.tensor([[[21.0]]]))
 
 
 def test_transport_rejects_duplicate_receive_queuing():

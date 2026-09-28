@@ -220,7 +220,7 @@ def test_working_async_pipelines_use_shared_driver_and_stage_output_cache(
         and isinstance(node.func, ast.Name)
     }
     assert "_pipefusion_async_components" in async_calls
-    assert "PipeFusionAsyncDriver" in async_functions
+    assert "PipeFusionImagePatchSchedule" in async_functions
 
 
 def test_flux1_runner_keeps_pipefusion_capability():

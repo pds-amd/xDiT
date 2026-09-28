@@ -32,9 +32,8 @@ def test_sd3_async_pipeline_combines_image_and_text_payloads():
     )
     source = _source(async_pipeline)
 
-    assert "payload_codec.unpack" in source
-    assert "payload_codec.pack" in source
-    assert "step_condition[0] = next_encoder_hidden_states" in source
+    assert "PipeFusionImagePatchSchedule" in source
+    assert "condition_reuse=True" in source
     assert 'name="encoder_hidden_states"' not in source
 
 

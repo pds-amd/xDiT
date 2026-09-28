@@ -27,10 +27,8 @@ from diffusers.utils import is_torch_xla_available
 
 from xfuser.config import EngineConfig
 from xfuser.model_executor.pipefusion import (
-    PipeFusionAsyncCallbacks,
-    PipeFusionAsyncDriver,
+    PipeFusionImagePatchSchedule,
     PipeFusionPatchLayout,
-    PipeFusionStagePayload,
     pipefusion_should_update_progress,
 )
 from xfuser.core.distributed import (
@@ -655,7 +653,6 @@ class xFuserFlux2PipelineBase(xFuserPipelineBaseWrapper):
     ):
         if len(timesteps) == 0:
             return latents
-        num_pipeline_patch = get_runtime_state().num_pipeline_patch
         num_pipeline_warmup_steps = get_runtime_state().runtime_config.warmup_steps
         if computation_mask is None:
             computation_mask = (1,) * len(timesteps)
@@ -668,18 +665,13 @@ class xFuserFlux2PipelineBase(xFuserPipelineBaseWrapper):
             image_latent_ids=image_latent_ids,
         )
         generated_sequence_length = latent_image_ids.shape[-2]
-        last_patch_latents = (
-            [None for _ in range(num_pipeline_patch)]
-            if is_pipeline_last_stage()
-            else None
-        )
         layout = PipeFusionPatchLayout.from_runtime_state(
             get_runtime_state(),
             split_dim=1,
             split_sizes=get_runtime_state().pp_patches_token_num,
             name="flux2-image",
         )
-        stage_output_cache, payload_codec, transport = (
+        stage_output_cache, _, transport = (
             self._pipefusion_async_components(
                 timesteps=timesteps,
                 computation_mask=computation_mask,
@@ -687,51 +679,18 @@ class xFuserFlux2PipelineBase(xFuserPipelineBaseWrapper):
                 model_name="FLUX.2 PipeFusion",
             )
         )
-        condition_states = [None] * num_pipeline_patch
-
-        def prepare_patch(work, _timestep, received):
-            patch_idx = work.patch_index
-            if is_pipeline_last_stage():
-                last_patch_latents[patch_idx] = patch_latents[patch_idx]
-            if received is not None:
-                if is_pipeline_first_stage():
-                    patch_latents[patch_idx] = received
-                else:
-                    payload = payload_codec.unpack(received, patch_idx)
-                    patch_latents[patch_idx] = payload.image_state
-                    condition_states[patch_idx] = payload.condition_state
-            return PipeFusionStagePayload(
-                image_state=patch_latents[patch_idx],
-                condition_state=(
-                    prompt_embeds
-                    if is_pipeline_first_stage()
-                    else condition_states[patch_idx]
-                ),
-            )
-
-        def forward_patch(work, timestep, prepared):
+        def forward_patch(work, timestep, image_state, condition_state):
             return self._backbone_forward(
-                latents=prepared.image_state,
-                encoder_hidden_states=prepared.condition_state,
+                latents=image_state,
+                encoder_hidden_states=condition_state,
                 text_ids=text_ids,
                 latent_image_ids=patch_latent_image_ids[work.patch_index],
                 guidance=guidance,
                 t=timestep,
             )
 
-        def commit_patch(work, timestep, output):
+        def update_last_patch(work, timestep, noise_pred, previous):
             patch_idx = work.patch_index
-            noise_pred, next_encoder_hidden_states = output
-            patch_latents[patch_idx] = noise_pred
-            if not is_pipeline_last_stage():
-                return payload_codec.pack(
-                    PipeFusionStagePayload(
-                        image_state=noise_pred,
-                        condition_state=next_encoder_hidden_states,
-                    ),
-                    patch_idx,
-                )
-
             patch_start = (
                 get_runtime_state().pp_patches_token_start_idx_local[patch_idx]
             )
@@ -745,23 +704,16 @@ class xFuserFlux2PipelineBase(xFuserPipelineBaseWrapper):
             # Empty reference-only tails must still advance the scheduler.
             generated_latents = self._scheduler_step(
                 noise_pred[:, :generated_patch_tokens, :],
-                last_patch_latents[patch_idx][
-                    :, :generated_patch_tokens, :
-                ],
+                previous[:, :generated_patch_tokens, :],
                 timestep,
             )
-            patch_latents[patch_idx] = torch.cat(
+            return torch.cat(
                 [
                     generated_latents,
-                    last_patch_latents[patch_idx][
-                        :, generated_patch_tokens:, :
-                    ],
+                    previous[:, generated_patch_tokens:, :],
                 ],
                 dim=-2,
             )
-            if work.step_index == work.num_steps - 1:
-                return None
-            return patch_latents[patch_idx]
 
         def end_step(step_index, _timestep):
             if pipefusion_should_update_progress(
@@ -803,20 +755,25 @@ class xFuserFlux2PipelineBase(xFuserPipelineBaseWrapper):
                 ]
             return torch.cat(latents_list, dim=-2)
 
-        hooks = PipeFusionAsyncCallbacks(
-            prepare_patch_fn=prepare_patch,
+        return PipeFusionImagePatchSchedule(
+            patch_latents=patch_latents,
+            layout=layout,
+            initial_condition=prompt_embeds,
+            first_stage=is_pipeline_first_stage(),
+            last_stage=is_pipeline_last_stage(),
+            condition_reuse=False,
             forward_patch_fn=forward_patch,
-            commit_patch_fn=commit_patch,
+            update_last_patch_fn=update_last_patch,
             finalize_fn=finalize,
             interrupted_fn=lambda: self.interrupt,
             end_step_fn=end_step,
-        )
-        return PipeFusionAsyncDriver(
-            transport=transport,
+            model_name="FLUX.2 PipeFusion",
+        ).run(
+            timesteps=timesteps,
             output_cache=stage_output_cache,
-            hooks=hooks,
             advance_patch=get_runtime_state().next_patch,
-        ).run(timesteps)
+            transport=transport,
+        )
 
     def _backbone_forward(
         self, latents, encoder_hidden_states, text_ids, latent_image_ids, guidance, t

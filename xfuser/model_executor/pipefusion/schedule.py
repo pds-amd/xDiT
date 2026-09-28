@@ -4,6 +4,7 @@ from typing import Callable, Generic, Optional, Protocol, Sequence, TypeVar
 import torch
 
 from .cache import PipeFusionStageOutputCache
+from .payload import CombinedTensorPayloadCodec, PipeFusionStagePayload
 from .transport import PipeFusionTransport, PipeFusionWorkItem
 
 
@@ -240,3 +241,167 @@ class PipeFusionAsyncDriver(Generic[PreparedPatch, StageOutput, Result]):
                 self.transport.prefetch(work)
         self.transport.wait_sends()
         return self.hooks.finalize()
+
+
+class PipeFusionImagePatchSchedule(Generic[Result]):
+    """Shared image-plus-condition PipeFusion adapter.
+
+    FLUX-family denoisers return an image prediction and a propagated text
+    state. This adapter owns the repeated receive/unpack, condition forwarding,
+    scheduler-feedback, and send lifecycle; models provide only their forward,
+    last-stage scheduler update, progress, and final assembly policies.
+    """
+
+    def __init__(
+        self,
+        *,
+        patch_latents: list[torch.Tensor],
+        layout,
+        initial_condition: torch.Tensor | Callable[[], torch.Tensor],
+        first_stage: bool,
+        last_stage: bool,
+        condition_reuse: bool,
+        forward_patch_fn: Callable[
+            [PipeFusionWorkItem, object, torch.Tensor, torch.Tensor],
+            tuple[torch.Tensor, Optional[torch.Tensor]],
+        ],
+        update_last_patch_fn: Callable[
+            [PipeFusionWorkItem, object, torch.Tensor, torch.Tensor],
+            torch.Tensor,
+        ],
+        finalize_fn: Callable[[], Result],
+        begin_step_fn: Callable[[int, object], None] = _ignore_step,
+        end_step_fn: Callable[[int, object], None] = _ignore_step,
+        interrupted_fn: Callable[[], bool] = _never_interrupted,
+        model_name: str = "PipeFusion",
+    ):
+        self.patch_latents = patch_latents
+        self.layout = layout
+        self.initial_condition = initial_condition
+        self.first_stage = first_stage
+        self.last_stage = last_stage
+        self.condition_reuse = condition_reuse
+        self.forward_patch_fn = forward_patch_fn
+        self.update_last_patch_fn = update_last_patch_fn
+        self.finalize_fn = finalize_fn
+        self.begin_step_fn = begin_step_fn
+        self.end_step_fn = end_step_fn
+        self.interrupted_fn = interrupted_fn
+        self.model_name = model_name
+
+    def run(
+        self,
+        *,
+        timesteps: Sequence,
+        output_cache: PipeFusionStageOutputCache,
+        transport: PipeFusionTransport,
+        advance_patch: Callable[[], None],
+    ) -> Result:
+        if len(self.patch_latents) != self.layout.num_patches:
+            raise ValueError(
+                f"{self.model_name} patch latent count does not match layout."
+            )
+
+        payload_codec = CombinedTensorPayloadCodec(
+            self.layout,
+            model_name=self.model_name,
+        )
+        previous = (
+            [None] * self.layout.num_patches if self.last_stage else None
+        )
+        condition_states = [None] * self.layout.num_patches
+        step_condition = [None]
+
+        def begin_step(step_index, timestep):
+            step_condition[0] = None
+            self.begin_step_fn(step_index, timestep)
+
+        def prepare_patch(work, _timestep, received):
+            patch_index = work.patch_index
+            if self.last_stage:
+                previous[patch_index] = self.patch_latents[patch_index]
+            if received is not None:
+                if self.first_stage:
+                    self.patch_latents[patch_index] = received
+                else:
+                    payload = payload_codec.unpack(received, patch_index)
+                    self.patch_latents[patch_index] = payload.image_state
+                    condition_states[patch_index] = payload.condition_state
+            if self.first_stage:
+                condition = (
+                    self.initial_condition()
+                    if callable(self.initial_condition)
+                    else self.initial_condition
+                )
+            elif self.condition_reuse and step_condition[0] is not None:
+                condition = step_condition[0]
+            else:
+                condition = condition_states[patch_index]
+            if condition is None:
+                raise RuntimeError(
+                    f"{self.model_name} missing condition state for patch "
+                    f"{patch_index}."
+                )
+            return PipeFusionStagePayload(
+                image_state=self.patch_latents[patch_index],
+                condition_state=condition,
+            )
+
+        def forward_patch(work, timestep, prepared):
+            return self.forward_patch_fn(
+                work,
+                timestep,
+                prepared.image_state,
+                prepared.condition_state,
+            )
+
+        def commit_patch(work, timestep, output):
+            patch_index = work.patch_index
+            image_state, next_condition = output
+            self.patch_latents[patch_index] = image_state
+            if self.last_stage:
+                updated = self.update_last_patch_fn(
+                    work,
+                    timestep,
+                    image_state,
+                    previous[patch_index],
+                )
+                self.patch_latents[patch_index] = updated
+                return (
+                    None
+                    if work.step_index == work.num_steps - 1
+                    else updated
+                )
+
+            if self.condition_reuse:
+                if patch_index == 0:
+                    step_condition[0] = next_condition
+                next_condition = step_condition[0]
+            if next_condition is None:
+                raise RuntimeError(
+                    f"{self.model_name} produced no condition state for patch "
+                    f"{patch_index}."
+                )
+            return payload_codec.pack(
+                PipeFusionStagePayload(
+                    image_state=image_state,
+                    condition_state=next_condition,
+                ),
+                patch_index,
+            )
+
+        callbacks = PipeFusionAsyncCallbacks(
+            prepare_patch_fn=prepare_patch,
+            forward_patch_fn=forward_patch,
+            commit_patch_fn=commit_patch,
+            finalize_fn=self.finalize_fn,
+            interrupted_fn=self.interrupted_fn,
+            begin_step_fn=begin_step,
+            end_step_fn=self.end_step_fn,
+        )
+        return PipeFusionAsyncDriver(
+            transport=transport,
+            output_cache=output_cache,
+            hooks=callbacks,
+            advance_patch=advance_patch,
+        ).run(timesteps)

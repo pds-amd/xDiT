@@ -14,6 +14,7 @@ from .schedule import (
     PipeFusionAsyncCallbacks,
     PipeFusionAsyncDriver,
     PipeFusionAsyncHooks,
+    PipeFusionImagePatchSchedule,
     pipefusion_should_update_progress,
 )
 from .transport import PipeFusionTransport, PipeFusionWorkItem
@@ -23,6 +24,7 @@ __all__ = [
     "PipeFusionAsyncCallbacks",
     "PipeFusionAsyncDriver",
     "PipeFusionAsyncHooks",
+    "PipeFusionImagePatchSchedule",
     "PipeFusionPatchLayout",
     "PipeFusionStageOutputCache",
     "PipeFusionStagePayload",

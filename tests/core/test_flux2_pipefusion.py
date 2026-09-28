@@ -36,8 +36,8 @@ def test_flux2_uses_atomic_image_and_text_payloads():
         if isinstance(node, ast.FunctionDef) and node.name == "_async_pipeline"
     )
     source = ast.unparse(async_method)
-    assert "payload_codec.pack" in source
-    assert "payload_codec.unpack" in source
+    assert "PipeFusionImagePatchSchedule" in source
+    assert "condition_reuse=False" in source
     assert 'name="encoder_hidden_states"' not in source
 
 
