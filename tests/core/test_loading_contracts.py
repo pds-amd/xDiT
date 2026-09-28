@@ -407,6 +407,18 @@ def test_pipefusion_allows_targeted_fsdp_for_replicated_components(contracts):
     )
 
 
+def test_stage_local_pipefusion_components_are_never_default_fsdp_targets():
+    source = (
+        ROOT
+        / "xfuser/model_executor/models/runner_models/loading/shard.py"
+    ).read_text()
+
+    assert "invalid_stage_shards = sharded_components & stage_local" in source
+    assert source.index("invalid_stage_shards = sharded_components & stage_local") < source.index(
+        "if requested is None:"
+    )
+
+
 @pytest.mark.parametrize("world_size", [1, 8])
 def test_a_request_nothing_contradicts_is_allowed_through(contracts, world_size):
     """A single rank degrades to eager rather than failing, so the same command line still runs."""

@@ -257,6 +257,22 @@ def test_transport_retains_async_send_until_drain():
     assert not group.blocking_sent
 
 
+def test_transport_retains_contiguous_wire_tensor_for_a_view():
+    group = _FakeGroup([])
+    transport = PipeFusionTransport(
+        group,
+        first_stage=False,
+        num_steps=1,
+        num_patches=1,
+    )
+    source = torch.arange(6, dtype=torch.float32).reshape(2, 3).transpose(0, 1)
+
+    transport.send(source, patch_index=0)
+
+    assert transport._send_tensors[0].is_contiguous()
+    assert torch.equal(transport._send_tensors[0], source.to(torch.float16))
+
+
 @pytest.mark.parametrize(
     ("step_index", "expected"),
     [

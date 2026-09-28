@@ -519,9 +519,17 @@ def apply_cache_dit_cache(
                 "stage-output caching."
             )
 
+        cache_overrides = (
+            json.loads(cache_config) if cache_config else {}
+        )
         install_pipefusion_scm_mask(
             pipe,
             (int(value) for value in computation_mask),
+            policy=(
+                None
+                if "steps_computation_mask" in cache_overrides
+                else "pipefusion"
+            ),
         )
         if _is_rank0():
             logger.info(
@@ -530,8 +538,13 @@ def apply_cache_dit_cache(
             )
         return transformer
 
-    if pipe is not None and hasattr(pipe, "_xdit_pipefusion_scm_mask"):
-        delattr(pipe, "_xdit_pipefusion_scm_mask")
+    if pipe is not None:
+        for attribute in (
+            "_xdit_pipefusion_scm_mask",
+            "_xdit_pipefusion_scm_policy",
+        ):
+            if hasattr(pipe, attribute):
+                delattr(pipe, attribute)
 
     from cache_dit import ParamsModifier
 

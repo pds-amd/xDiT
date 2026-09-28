@@ -35,6 +35,23 @@ def test_async_schedule_slices_warmup_and_forces_fresh_predecessor():
     assert pipefusion_async_computation_mask(pipeline, 5, 1) == (1, 1, 0, 1)
 
 
+def test_pipefusion_policy_rebuilds_mask_for_runtime_step_count():
+    pipeline = type(
+        "_Pipeline",
+        (),
+        {
+            "_xdit_pipefusion_scm_mask": (1,) * 50,
+            "_xdit_pipefusion_scm_policy": "pipefusion",
+        },
+    )()
+
+    mask = pipefusion_async_computation_mask(pipeline, 28, 1)
+
+    assert len(mask) == 27
+    assert mask[0] == 1
+    assert 0 in mask
+
+
 def test_pipeline_without_scm_uses_all_compute_schedule():
     assert pipefusion_async_computation_mask(object(), 5, 2) == (1, 1, 1)
 
@@ -204,3 +221,29 @@ def test_working_async_pipelines_use_shared_driver_and_stage_output_cache(
     }
     assert "_pipefusion_async_components" in async_calls
     assert "PipeFusionAsyncDriver" in async_functions
+
+
+def test_flux1_runner_keeps_pipefusion_capability():
+    path = ROOT / "xfuser/model_executor/models/runner_models/flux.py"
+    module = ast.parse(path.read_text())
+    runner = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "xFuserFluxModel"
+    )
+    capabilities = next(
+        node.value
+        for node in runner.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "capabilities"
+            for target in node.targets
+        )
+    )
+
+    assert any(
+        keyword.arg == "pipefusion_parallel_degree"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in capabilities.keywords
+    )

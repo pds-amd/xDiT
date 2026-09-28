@@ -5,6 +5,17 @@ StagePayload = TypeVar("StagePayload")
 _MISSING = object()
 
 
+def build_pipefusion_scm_mask(num_timesteps: int) -> Tuple[int, ...]:
+    """Return the static global-SCM policy for a PipeFusion invocation."""
+    mask = [1] * num_timesteps
+    first_cache_step = round((num_timesteps - 1) / 3)
+    last_cache_step = round((num_timesteps - 1) * 5 / 6)
+    for index in range(first_cache_step, last_cache_step + 1, 2):
+        if 0 < index < num_timesteps - 1:
+            mask[index] = 0
+    return tuple(mask)
+
+
 def normalize_pipefusion_scm_mask(
     mask: Iterable[int],
     num_timesteps: int,
@@ -45,7 +56,12 @@ def pipefusion_async_computation_mask(
         raise ValueError(
             "PipeFusion warmup steps must be between zero and the timestep count."
         )
-    mask = getattr(pipeline, "_xdit_pipefusion_scm_mask", None)
+    policy = getattr(pipeline, "_xdit_pipefusion_scm_policy", None)
+    mask = (
+        build_pipefusion_scm_mask(total_timesteps)
+        if policy == "pipefusion"
+        else getattr(pipeline, "_xdit_pipefusion_scm_mask", None)
+    )
     if mask is None:
         return (1,) * (total_timesteps - warmup_steps)
 
@@ -57,8 +73,14 @@ def pipefusion_async_computation_mask(
     return tuple(async_mask)
 
 
-def install_pipefusion_scm_mask(pipeline, mask: Iterable[int]) -> None:
+def install_pipefusion_scm_mask(
+    pipeline,
+    mask: Iterable[int],
+    *,
+    policy: str | None = None,
+) -> None:
     pipeline._xdit_pipefusion_scm_mask = tuple(mask)
+    pipeline._xdit_pipefusion_scm_policy = policy
 
 
 def supports_pipefusion_stage_cache(pipeline) -> bool:

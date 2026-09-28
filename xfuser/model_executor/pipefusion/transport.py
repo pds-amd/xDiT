@@ -98,6 +98,10 @@ class PipeFusionTransport:
             and tensor.dtype != wire_dtype
         ):
             tensor = tensor.to(wire_dtype)
+        # pipeline_isend() also makes its input contiguous. Do it here so this
+        # retained reference is the tensor owned by the asynchronous NCCL work,
+        # rather than a pre-contiguous view whose temporary send buffer can die.
+        tensor = tensor.contiguous()
         work = self.group.pipeline_isend(
             tensor,
             name=self.payload_name,
