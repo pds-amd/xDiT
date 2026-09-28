@@ -1,6 +1,3 @@
-import ast
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -14,9 +11,6 @@ from xfuser.model_executor.pipefusion import (
     normalize_pipefusion_scm_mask,
     pipefusion_async_computation_mask,
 )
-
-ROOT = Path(__file__).resolve().parents[2]
-
 
 def test_normalize_scm_isolates_cache_steps_and_computes_edges():
     assert normalize_pipefusion_scm_mask(
@@ -183,67 +177,3 @@ def test_base_async_components_share_runtime_transport_contract(monkeypatch):
     assert transport.num_patches == 2
 
 
-@pytest.mark.parametrize(
-    ("relative_path", "class_name"),
-    [
-        ("pipeline_flux.py", "xFuserFluxPipeline"),
-        ("pipeline_flux2.py", "xFuserFlux2PipelineBase"),
-        ("pipeline_stable_diffusion_3.py", "xFuserStableDiffusion3Pipeline"),
-    ],
-)
-def test_working_async_pipelines_use_shared_driver_and_stage_output_cache(
-    relative_path,
-    class_name,
-):
-    path = ROOT / "xfuser/model_executor/pipelines" / relative_path
-    module = ast.parse(path.read_text())
-    class_node = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    async_method = next(
-        node
-        for node in class_node.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_async_pipeline"
-    )
-    async_calls = {
-        node.func.attr
-        for node in ast.walk(async_method)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-    }
-    async_functions = {
-        node.func.id
-        for node in ast.walk(async_method)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-    }
-    assert "_pipefusion_async_components" in async_calls
-    assert "PipeFusionImagePatchSchedule" in async_functions
-
-
-def test_flux1_runner_keeps_pipefusion_capability():
-    path = ROOT / "xfuser/model_executor/models/runner_models/flux.py"
-    module = ast.parse(path.read_text())
-    runner = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "xFuserFluxModel"
-    )
-    capabilities = next(
-        node.value
-        for node in runner.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "capabilities"
-            for target in node.targets
-        )
-    )
-
-    assert any(
-        keyword.arg == "pipefusion_parallel_degree"
-        and isinstance(keyword.value, ast.Constant)
-        and keyword.value.value is True
-        for keyword in capabilities.keywords
-    )

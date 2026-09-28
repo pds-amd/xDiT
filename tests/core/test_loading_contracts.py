@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from xfuser.model_executor.models.runner_models.loading import shard
+
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_PATH = (
     ROOT / "xfuser/model_executor/models/runner_models/loading/contracts.py"
@@ -407,16 +409,32 @@ def test_pipefusion_allows_targeted_fsdp_for_replicated_components(contracts):
     )
 
 
-def test_stage_local_pipefusion_components_are_never_default_fsdp_targets():
-    source = (
-        ROOT
-        / "xfuser/model_executor/models/runner_models/loading/shard.py"
-    ).read_text()
+def test_stage_local_pipefusion_components_are_never_default_fsdp_targets(
+    monkeypatch,
+):
+    group = type("Group", (), {"local_rank": 0, "device_group": object()})()
+    model = type(
+        "Model",
+        (),
+        {
+            "config": type("Config", (), {"fully_shard_components": None})(),
+            "settings": type("Settings", (), {"fsdp_strategy": {"transformer": {}}})(),
+            "pipe": type("Pipe", (), {"components": {"transformer": object()}})(),
+        },
+    )()
+    loader = type(
+        "Loader",
+        (),
+        {
+            "model": model,
+            "is_pipeline_stage_blockwise": staticmethod(lambda _component: True),
+        },
+    )()
+    monkeypatch.setattr(shard, "get_world_group", lambda: group)
+    monkeypatch.setattr(shard, "get_fs_group", lambda: group)
 
-    assert "invalid_stage_shards = sharded_components & stage_local" in source
-    assert source.index("invalid_stage_shards = sharded_components & stage_local") < source.index(
-        "if requested is None:"
-    )
+    with pytest.raises(ValueError, match="stage-local components"):
+        shard.shard_pipeline_components(loader)
 
 
 @pytest.mark.parametrize("world_size", [1, 8])

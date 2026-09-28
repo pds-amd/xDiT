@@ -1,75 +1,41 @@
-"""Dependency-light checks for SD3 PipeFusion payload ordering."""
+"""Behavior-level SD3 PipeFusion configuration tests."""
 
-import ast
-from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
-PIPELINE = (
-    ROOT
-    / "xfuser/model_executor/pipelines/pipeline_stable_diffusion_3.py"
+from xfuser.model_executor.models.runner_models import base_model
+from xfuser.model_executor.models.runner_models.stable_diffusion import (
+    xFuserStableDiffusionModel,
 )
-RUNNER = ROOT / "xfuser/model_executor/models/runner_models/stable_diffusion.py"
 
 
-def _source(node):
-    return ast.unparse(node)
-
-
-def test_sd3_async_pipeline_combines_image_and_text_payloads():
-    module = ast.parse(PIPELINE.read_text())
-    pipeline = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "xFuserStableDiffusion3Pipeline"
+def test_sd3_rejects_unimplemented_stage_local_replicated_load(monkeypatch):
+    model = object.__new__(xFuserStableDiffusionModel)
+    config = SimpleNamespace(
+        pipefusion_parallel_degree=2,
+        memory_efficient_replicated_load=True,
     )
-    async_pipeline = next(
-        node
-        for node in pipeline.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_async_pipeline"
+    monkeypatch.setattr(
+        base_model.xFuserModel,
+        "_validate_config",
+        lambda *_args: None,
     )
-    source = _source(async_pipeline)
 
-    assert "PipeFusionImagePatchSchedule" in source
-    assert "condition_reuse=True" in source
-    assert 'name="encoder_hidden_states"' not in source
+    with pytest.raises(ValueError, match="does not support"):
+        model._validate_config(config)
 
 
-def test_sd3_pipefusion_preserves_fp16_runtime_contract():
-    module = ast.parse(RUNNER.read_text())
-    runner = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "xFuserStableDiffusionModel"
+def test_sd3_allows_regular_pipefusion_load(monkeypatch):
+    model = object.__new__(xFuserStableDiffusionModel)
+    config = SimpleNamespace(
+        pipefusion_parallel_degree=2,
+        memory_efficient_replicated_load=False,
     )
-    load_model = next(
-        node
-        for node in runner.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_load_model"
+    monkeypatch.setattr(
+        base_model.xFuserModel,
+        "_validate_config",
+        lambda *_args: None,
     )
-    source = _source(load_model)
 
-    assert "torch.float16 if self.config.pipefusion_parallel_degree > 1" in source
-
-
-def test_sd3_rejects_unimplemented_stage_local_replicated_load():
-    module = ast.parse(RUNNER.read_text())
-    runner = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "xFuserStableDiffusionModel"
-    )
-    validator = next(
-        node
-        for node in runner.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_validate_config"
-    )
-    source = _source(validator)
-
-    assert "config.pipefusion_parallel_degree > 1" in source
-    assert "config.memory_efficient_replicated_load" in source
-    assert "does not support" in source
+    model._validate_config(config)

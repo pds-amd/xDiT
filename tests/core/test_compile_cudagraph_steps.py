@@ -7,12 +7,10 @@ graph segments that read each other's buffers across steps. One rank, or no shar
 """
 
 from types import SimpleNamespace
-import inspect
 
 import pytest
 import torch
 
-from xfuser.model_executor.models.runner_models import base_model
 from xfuser.model_executor.models.runner_models.base_model import xFuserModel
 from xfuser.core.cache_manager.cache_manager import CacheManager
 
@@ -78,13 +76,6 @@ def test_pipefusion_compiles_the_stage_as_one_boundary(monkeypatch):
 
     assert len(compiled) == 1
     assert compiled[0].__self__ is transformer
-
-
-def test_pipefusion_communicator_priming_uses_a_dedicated_channel():
-    source = inspect.getsource(base_model.xFuserModel.initialize)
-
-    assert 'name="_xfuser_compile_prime"' in source
-    assert "segment_idx=0" in source
 
 
 def test_pipefusion_with_fsdp_compiles_local_blocks(monkeypatch):

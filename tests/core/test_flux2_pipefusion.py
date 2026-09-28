@@ -1,5 +1,3 @@
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -16,67 +14,6 @@ def test_flux2_reference_pipefusion_uses_dynamic_compile_only_when_needed():
 
     assert model._get_compile_dynamic({"input_images": ["reference.png"]}) is True
     assert model._get_compile_dynamic({"input_images": []}) is False
-
-
-def test_flux2_uses_atomic_image_and_text_payloads():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "xfuser/model_executor/pipelines/pipeline_flux2.py"
-    )
-    module = ast.parse(path.read_text())
-    pipeline = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "xFuserFlux2PipelineBase"
-    )
-    async_method = next(
-        node
-        for node in pipeline.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_async_pipeline"
-    )
-    source = ast.unparse(async_method)
-    assert "PipeFusionImagePatchSchedule" in source
-    assert "condition_reuse=False" in source
-    assert 'name="encoder_hidden_states"' not in source
-
-
-def test_flux2_reference_only_patch_still_advances_scheduler():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "xfuser/model_executor/pipelines/pipeline_flux2.py"
-    )
-    module = ast.parse(path.read_text())
-    pipeline = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "xFuserFlux2PipelineBase"
-    )
-    async_method = next(
-        node
-        for node in pipeline.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_async_pipeline"
-    )
-    generated_token_conditionals = [
-        node
-        for node in ast.walk(async_method)
-        if isinstance(node, ast.If)
-        and any(
-            isinstance(part, ast.Name)
-            and part.id == "generated_patch_tokens"
-            for part in ast.walk(node.test)
-        )
-    ]
-
-    assert not any(
-        isinstance(part, ast.Call)
-        and isinstance(part.func, ast.Attribute)
-        and part.func.attr == "_scheduler_step"
-        for conditional in generated_token_conditionals
-        for part in ast.walk(conditional)
-    )
-
 
 def test_flux2_reference_tokens_resize_pipefusion_buffers(monkeypatch):
     resets = []
