@@ -24,7 +24,6 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
 @register_model("stable-diffusion-3.5-large")
 @register_model("SD3.5")
 class xFuserStableDiffusionModel(xFuserModel):
-    # The composition wrapper has no config-only transformer construction seam.
     load_support = LoadSupport(
         meta_transformers=(),
         meta_text_encoders=(),
@@ -76,10 +75,11 @@ class xFuserStableDiffusionModel(xFuserModel):
     )
 
     def _load_model(self) -> DiffusionPipeline:
-        # SD3's wrapper is composition-style (wraps a transformer instance) and lacks
-        # ConfigMixin.load_config, so it cannot be built on meta like flux/z_image. Load real on
-        # every rank; the per-rank AITER fp8 walk quantizes the real weights CPU->GPU afterwards.
-        dtype = torch.float16 if self.config.pipefusion_parallel_degree > 1 else torch.bfloat16
+        dtype = (
+            torch.float16
+            if self.config.pipefusion_parallel_degree > 1
+            else torch.bfloat16
+        )
         return xFuserStableDiffusion3Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             engine_config=self.engine_config,

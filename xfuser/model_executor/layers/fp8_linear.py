@@ -320,6 +320,16 @@ class xFuserFP8BlockScaleLinear(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_shape = input.shape
         x = input.reshape(-1, self.in_features)
+        # AITER's block-scale activation quantizer accepts fp16/bf16 but aborts the
+        # process for fp32. Some text encoders intentionally promote residual paths
+        # to fp32 even when their linear weights use a lower compute dtype.
+        if x.dtype == torch.float32:
+            compute_dtype = (
+                self._compute_dtype
+                if self._compute_dtype in (torch.float16, torch.bfloat16)
+                else torch.bfloat16
+            )
+            x = x.to(compute_dtype)
         weight_fp8, weight_scale = self._gemm_operands(x)
         if self.preshuffle:
             k_padded = ((self.in_features + _FP8_BLOCK - 1) // _FP8_BLOCK) * _FP8_BLOCK

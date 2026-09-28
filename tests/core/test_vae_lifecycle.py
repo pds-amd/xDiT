@@ -4,6 +4,7 @@ from unittest import mock
 import torch
 from torch import nn
 
+from xfuser.model_executor.pipelines import base_pipeline
 from xfuser.model_executor.models.runner_models import base_model
 from xfuser.model_executor.models.runner_models.base_model import xFuserModel
 from xfuser.model_executor.models.runner_models.vae_manager import VAEManager
@@ -74,11 +75,12 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
         _decoding_vaes = xFuserModel._decoding_vaes
 
         def __init__(self):
+            self.engine = SimpleNamespace(runtime_config=SimpleNamespace())
             self.config = SimpleNamespace(
                 use_parallel_vae=True,
                 use_torch_compile=False,
                 cache_method=None,
-                create_config=lambda: (object(), None),
+                create_config=lambda: (self.engine, None),
             )
             self.loader = mock.Mock()
             self._vae_manager = mock.Mock()
@@ -87,6 +89,14 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
             )
 
         def _load_model_checked(self):
+            assert (
+                self.engine.runtime_config.runner_managed_parallel_vae
+                is True
+            )
+            assert (
+                self.engine.runtime_config.runner_managed_torch_compile
+                is True
+            )
             return Pipe(first)
 
         def _get_runtime_state_pipeline(self):
@@ -114,3 +124,41 @@ def test_initialize_sets_up_every_parallel_vae_before_enabling_options(monkeypat
 
     assert events == ["post-load", "parallel", "options"]
     runner._vae_manager.setup_parallel_vae.assert_called_once_with([first, second])
+
+
+def test_parallel_vae_broadcast_uses_one_wire_dtype(monkeypatch):
+    class World:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+
+        def broadcast(self, tensor, src):
+            assert src == 0
+
+    world = World()
+    monkeypatch.setattr(base_pipeline, "get_world_group", lambda: world)
+    monkeypatch.setattr(base_pipeline, "get_device", lambda _: torch.device("cpu"))
+    monkeypatch.setattr(base_pipeline, "is_dp_last_group", lambda: True)
+    monkeypatch.setattr(
+        base_pipeline,
+        "get_runtime_state",
+        lambda: SimpleNamespace(
+            runtime_config=SimpleNamespace(dtype=torch.bfloat16)
+        ),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda outputs, value: outputs[0].copy_(value),
+    )
+
+    latents = torch.randn(1, 4, 2, 2, dtype=torch.float32)
+    actual = (
+        base_pipeline.xFuserPipelineBaseWrapper.gather_broadcast_latents(
+            SimpleNamespace(_release_transformer_kv_cache=lambda: None),
+            latents,
+        )
+    )
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), latents, rtol=4e-3, atol=4e-3)

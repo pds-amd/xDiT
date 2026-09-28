@@ -38,9 +38,21 @@ logger = init_logger(__name__)
 class FlexibleArgumentParser(argparse.ArgumentParser):
     """ArgumentParser that allows both underscore and dash in names."""
 
+    _deprecated_option_aliases = {
+        "--warmup_steps": "--pipefusion_sync_steps",
+    }
+
     def _normalize_name(self, name: str) -> str:
         # First, try the standard normalization (all hyphens to underscores)
         fully_normalized = "--" + name[len("--"):].replace("-", "_")
+        replacement = self._deprecated_option_aliases.get(fully_normalized)
+        if replacement is not None:
+            warnings.warn(
+                f"{fully_normalized} is deprecated; use {replacement}",
+                FutureWarning,
+                stacklevel=3,
+            )
+            fully_normalized = replacement
         if fully_normalized in self._option_string_actions:
             return fully_normalized
 
@@ -68,6 +80,43 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
                 processed_args.append(arg)
 
         return super().parse_args(processed_args, namespace)
+
+
+def _add_pipefusion_runtime_args(parser) -> None:
+    parser.add_argument(
+        "--pipefusion_sync_steps",
+        dest="warmup_steps",
+        type=int,
+        default=1,
+        help="Number of synchronous denoising steps before asynchronous PipeFusion.",
+    )
+    parser.add_argument(
+        "--disable_pipefusion_image_query_only",
+        action="store_true",
+        help="Disable later-patch image-query-only execution for PipeFusion comparisons.",
+    )
+
+
+def _add_pipefusion_parallel_args(parser) -> None:
+    parser.add_argument(
+        "--pipefusion_parallel_degree",
+        type=int,
+        default=1,
+        help="PipeFusion pipeline stage count.",
+    )
+    parser.add_argument(
+        "--num_pipeline_patch",
+        type=int,
+        default=None,
+        help="Number of feature-map patches for PipeFusion.",
+    )
+    parser.add_argument(
+        "--attn_layer_num_for_pp",
+        default=None,
+        nargs="*",
+        type=int,
+        help="Attention-layer count assigned to each PipeFusion stage.",
+    )
 
 
 def nullable_str(val: str):
@@ -170,6 +219,7 @@ class xFuserArgs:
     trust_remote_code: bool = False
     # Runtime arguments
     warmup_steps: int = 1
+    disable_pipefusion_image_query_only: bool = False
     # use_cuda_graph: bool = True
     use_parallel_vae: bool = False
     # use_profiler: bool = False
@@ -273,6 +323,7 @@ class xFuserArgs:
     dataset_path: Optional[str] = None
     use_fsdp: bool = False
     fully_shard_degree: int = 1
+    fully_shard_components: Optional[List[str]] = None
     reshard_after_forward: bool = True
     memory_efficient_sharding: bool = False
     memory_efficient_replicated_load: bool = False
@@ -320,6 +371,19 @@ class xFuserArgs:
                 "--profile_with_stack has no effect without --profile; "
                 "no profiles will be outputted."
             )
+        if self.fully_shard_components is not None:
+            self.fully_shard_components = list(
+                dict.fromkeys(self.fully_shard_components)
+            )
+            if not self.fully_shard_components:
+                raise ValueError(
+                    "--fully_shard_components requires at least one component"
+                )
+            if self.fully_shard_degree <= 1:
+                raise ValueError(
+                    "--fully_shard_components requires "
+                    "--fully_shard_degree greater than 1"
+                )
         self._resolve_gemm_quantization()
         if self.cache_method is None:
             if self.use_fbcache:
@@ -461,9 +525,7 @@ class xFuserArgs:
 
         # Runtime arguments
         runtime_group = parser.add_argument_group("Runtime Options")
-        runtime_group.add_argument(
-            "--warmup_steps", type=int, default=1, help="Warmup steps in generation."
-        )
+        _add_pipefusion_runtime_args(runtime_group)
         # runtime_group.add_argument("--use_cuda_graph", action="store_true")
         runtime_group.add_argument("--use_parallel_vae", action="store_true")
         # runtime_group.add_argument("--use_profiler", action="store_true")
@@ -558,25 +620,7 @@ class xFuserArgs:
             action="store_true",
             help="Enable t5 encoder sharding.",
         )
-        parallel_group.add_argument(
-            "--pipefusion_parallel_degree",
-            type=int,
-            default=1,
-            help="Pipefusion parallel degree. Indicates the number of pipeline stages.",
-        )
-        parallel_group.add_argument(
-            "--num_pipeline_patch",
-            type=int,
-            default=None,
-            help="Number of patches the feature map should be segmented in pipefusion parallel.",
-        )
-        parallel_group.add_argument(
-            "--attn_layer_num_for_pp",
-            default=None,
-            nargs="*",
-            type=int,
-            help="List representing the number of layers per stage of the pipeline in pipefusion parallel",
-        )
+        _add_pipefusion_parallel_args(parallel_group)
         parallel_group.add_argument(
             "--tensor_parallel_degree",
             type=int,
@@ -848,12 +892,8 @@ class xFuserArgs:
             default=1,
             help="Ring sequence parallel degree. Used in attention layer.",
         )
-        parser.add_argument(
-            "--pipefusion_parallel_degree",
-            type=int,
-            default=1,
-            help="Pipefusion parallel degree. Indicates the number of pipeline stages.",
-        )
+        _add_pipefusion_parallel_args(parser)
+        _add_pipefusion_runtime_args(parser)
         parser.add_argument(
             "--tensor_parallel_degree",
             type=int,
@@ -871,6 +911,16 @@ class xFuserArgs:
             type=int,
             default=1,
             help="Fully sharding (sharding) degree."
+        )
+        parser.add_argument(
+            "--fully_shard_components",
+            nargs="+",
+            default=None,
+            help=(
+                "Only FSDP-wrap these pipeline components (for example "
+                "'text_encoder'). By default every component named by the "
+                "model's FSDP strategy is sharded."
+            ),
         )
         parser.add_argument(
             "--no_reshard_after_forward",
@@ -897,8 +947,9 @@ class xFuserArgs:
                  "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
                  "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
                  "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
-                 "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
-                 "which loads per-rank weights anyway, or on a single rank.",
+                 "With PipeFusion, this instead enables stage-local transformer loading and can be "
+                 "combined with --fully_shard_components for replicated components. It has no "
+                 "effect with other weight-splitting parallelism or on a single rank.",
         )
         parser.add_argument(
             "--height",
@@ -1493,6 +1544,7 @@ class xFuserArgs:
 
         runtime_config = RuntimeConfig(
             warmup_steps=self.warmup_steps,
+            disable_pipefusion_image_query_only=self.disable_pipefusion_image_query_only,
             # use_cuda_graph=self.use_cuda_graph,
             use_hybrid_attn_schedule=self.use_hybrid_attn_schedule,
             use_parallel_vae=self.use_parallel_vae,

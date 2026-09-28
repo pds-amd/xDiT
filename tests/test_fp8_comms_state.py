@@ -106,15 +106,31 @@ def test_unexercised_model_has_zero_running_max():
     assert model_state.q_running_max.max() == 0
 
 
-def test_fp8_comms_rejects_pipefusion():
+def test_fp8_comms_is_config_compatible_with_pure_pipefusion():
     config = SimpleNamespace(
         use_fp8_comms=True,
         pipefusion_parallel_degree=2,
+        ulysses_degree=1,
+        enable_sequential_cpu_offload=False,
+        enable_model_cpu_offload=False,
+        enable_group_cpu_offload=False,
     )
     capabilities = SimpleNamespace(use_fp8_comms=True)
     settings = SimpleNamespace(model_name="test-model")
 
-    with pytest.raises(ValueError, match="does not support PipeFusion"):
+    validate_fp8_comms_config(config, capabilities, settings)
+
+
+def test_fp8_comms_rejects_hybrid_pipefusion_ulysses():
+    config = SimpleNamespace(
+        use_fp8_comms=True,
+        pipefusion_parallel_degree=2,
+        ulysses_degree=2,
+    )
+    capabilities = SimpleNamespace(use_fp8_comms=True)
+    settings = SimpleNamespace(model_name="test-model")
+
+    with pytest.raises(ValueError, match="hybrid PipeFusion"):
         validate_fp8_comms_config(config, capabilities, settings)
 
 

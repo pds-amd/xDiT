@@ -4,6 +4,7 @@ import torch.distributed
 import torch.nn as nn
 
 from diffusers.models.embeddings import PatchEmbed
+from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.utils import (
@@ -17,7 +18,12 @@ from xfuser.core.distributed.fp8_comms import register_fp8_comms_eligible_module
 from xfuser.core.distributed.runtime_state import get_runtime_state
 from xfuser.logger import init_logger
 from xfuser.model_executor.base_wrapper import xFuserBaseWrapper
-from xfuser.core.distributed import is_pipeline_first_stage, is_pipeline_last_stage
+from xfuser.core.distributed import (
+    get_pipeline_parallel_world_size,
+    get_sequence_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from .register import xFuserTransformerWrappersRegister
 from .base_transformer import xFuserTransformerBaseWrapper
 
@@ -33,6 +39,98 @@ def sd3_attn_modules(transformer) -> list[nn.Module]:
         if attn2 is not None:
             modules.append(attn2)
     return modules
+
+
+def _can_use_sd3_image_query_only(
+    block: nn.Module,
+    encoder_hidden_states: Optional[torch.Tensor],
+    joint_attention_kwargs: Optional[Dict[str, Any]],
+) -> bool:
+    state = get_runtime_state()
+    image_only_disabled = getattr(
+        getattr(state, "runtime_config", None),
+        "disable_pipefusion_image_query_only",
+        False,
+    )
+    return (
+        not image_only_disabled
+        and isinstance(block, JointTransformerBlock)
+        and not block.training
+        and state.patch_mode
+        and state.pipeline_patch_idx > 0
+        and state.num_pipeline_patch > 1
+        and get_pipeline_parallel_world_size() > 1
+        and get_sequence_parallel_world_size() == 1
+        and encoder_hidden_states is not None
+        and not joint_attention_kwargs
+        and getattr(block, "_chunk_size", None) is None
+    )
+
+
+def _sd3_block_forward(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    joint_attention_kwargs: Optional[Dict[str, Any]],
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    if not _can_use_sd3_image_query_only(
+        block, encoder_hidden_states, joint_attention_kwargs
+    ):
+        return block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            temb=temb,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+
+    if block.use_dual_attention:
+        (
+            norm_hidden_states,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            norm_hidden_states2,
+            gate_msa2,
+        ) = block.norm1(hidden_states, emb=temb)
+    else:
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            block.norm1(hidden_states, emb=temb)
+        )
+
+    if block.context_pre_only:
+        norm_encoder_hidden_states = block.norm1_context(
+            encoder_hidden_states, temb
+        )
+    else:
+        norm_encoder_hidden_states = block.norm1_context(
+            encoder_hidden_states, emb=temb
+        )[0]
+
+    attn_output = block.attn(
+        hidden_states=norm_hidden_states,
+        encoder_hidden_states=norm_encoder_hidden_states,
+        image_query_only=True,
+    )
+    hidden_states = hidden_states + gate_msa.unsqueeze(1) * attn_output
+
+    if block.use_dual_attention:
+        attn_output2 = block.attn2(hidden_states=norm_hidden_states2)
+        hidden_states = hidden_states + gate_msa2.unsqueeze(1) * attn_output2
+
+    norm_hidden_states = block.norm2(hidden_states)
+    norm_hidden_states = (
+        norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+    )
+    hidden_states = (
+        hidden_states
+        + gate_mlp.unsqueeze(1) * block.ff(norm_hidden_states)
+    )
+    return (
+        None if block.context_pre_only else encoder_hidden_states,
+        hidden_states,
+    )
 
 
 @xFuserTransformerWrappersRegister.register(SD3Transformer2DModel)
@@ -151,18 +249,36 @@ class xFuserSD3Transformer2DWrapper(xFuserTransformerBaseWrapper):
                         hidden_states=hidden_states,
                         encoder_hidden_states=encoder_hidden_states,
                         temb=temb,
+                        joint_attention_kwargs=joint_attention_kwargs,
                     )
                 elif get_runtime_state().patch_mode:
-                    _, hidden_states = block(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=self.encoder_hidden_states_cache[i],
-                        temb=temb,
+                    cached_encoder_hidden_states = self.encoder_hidden_states_cache[i]
+                    block_encoder_hidden_states = (
+                        cached_encoder_hidden_states
+                        if cached_encoder_hidden_states is not None
+                        else encoder_hidden_states
                     )
+                    if cached_encoder_hidden_states is None:
+                        _, hidden_states = block(
+                            hidden_states=hidden_states,
+                            encoder_hidden_states=block_encoder_hidden_states,
+                            temb=temb,
+                            joint_attention_kwargs=joint_attention_kwargs,
+                        )
+                    else:
+                        _, hidden_states = _sd3_block_forward(
+                            block,
+                            hidden_states,
+                            block_encoder_hidden_states,
+                            temb,
+                            joint_attention_kwargs,
+                        )
                 else:
                     encoder_hidden_states, hidden_states = block(
                         hidden_states=hidden_states,
                         encoder_hidden_states=encoder_hidden_states,
                         temb=temb,
+                        joint_attention_kwargs=joint_attention_kwargs,
                     )
 
         # * only the last pp rank needs unpatchify

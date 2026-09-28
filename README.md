@@ -238,14 +238,14 @@ examples/pixartalpha_example.py \
 --pipefusion_parallel_degree 2 \
 --ulysses_degree 2 \
 --num_inference_steps 20 \
---warmup_steps 0 \
+--pipefusion_sync_steps 1 \
 --prompt "A cute dog" \
 --use_cfg_parallel
 ```
 
-⚠️ Applying PipeFusion requires setting `warmup_steps`, also required in DistriFusion, typically set to a small number compared with `num_inference_steps`.
-The warmup step impacts the efficiency of PipeFusion as it cannot be executed in parallel, thus degrading to a serial execution.
-We observed that a warmup of 0 had no effect on the PixArt model.
+⚠️ Applying PipeFusion requires setting `pipefusion_sync_steps`, typically to a
+small number compared with `num_inference_steps`. These initial steps run
+synchronously, so increasing the value reduces pipeline efficiency.
 Users can tune this value according to their specific tasks.
 
 ### 5. Launch an HTTP Service
@@ -422,7 +422,9 @@ For usage instructions, refer to the [example/run.sh](./examples/run.sh). Simply
 <h4 id="cache_acceleration">Cache Acceleration</h4>
 
 You can use `--use_teacache` or `--use_fbcache` in examples/run.sh, which applies TeaCache and First-Block-Cache respectively.
-Note, cache method is only supported for FLUX model with USP. It is currently not applicable for PipeFusion.
+For FLUX.1, `--cache_method dbcache` can also use the validated PipeFusion
+global SCM policy. Other PipeFusion models retain their model-specific
+per-block cache behavior until they have independent quality validation.
 
 xDiT also provides DiTFastAttn for single GPU acceleration. It can reduce the computation cost of attention layers by leveraging redundancies between different steps of the Diffusion Model.
 

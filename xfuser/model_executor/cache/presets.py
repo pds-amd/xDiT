@@ -32,8 +32,12 @@ class DBCachePreset:
     # steps before cache kicks in
     max_warmup_steps: int = 8
     max_cached_steps: int = -1
-    # SCM steps_computation_mask policy: None | "slow" | "medium" | "fast" | "ultra"
+    # SCM policy: None | "slow" | "medium" | "fast" | "ultra" | "pipefusion".
+    # "pipefusion" alternates cache/compute through the middle denoising window.
     scm_policy: Optional[str] = "fast"
+    # "dynamic" also requires the residual threshold to pass; "static" makes
+    # SCM the sole decision source, which keeps PipeFusion stages in lockstep.
+    steps_computation_policy: str = "dynamic"
     # enable_taylorseer: None/True attaches the TaylorSeer calibrator (default DBCache
     # behavior). Set False to run the plain Fn-block residual cache with no calibrator
     # (e.g. "true" FBCache when Fn_compute_blocks=1 and scm_policy=None).
@@ -61,10 +65,16 @@ class CacheDitAdapterConfig:
 
     enable_separate_cfg: True for models where CFG runs as two separate forward passes
         (Wan, Qwen-Image-Edit). False for fused or no-CFG models (FLUX, SD3, ZImage).
+
+    pipefusion_global_scm_cache: under PipeFusion, use the SCM mask to skip
+        complete denoiser evaluations and reuse the last assembled prediction.
+        The adapter defaults this path to the static ``pipefusion`` policy;
+        ordinary non-PipeFusion runs retain the preset's block-cache policy.
     """
     blocks: Tuple[Tuple[str, str], ...]
     enable_separate_cfg: bool = False
     transformer_attr: str = "transformer"
+    pipefusion_global_scm_cache: bool = False
 
 
 AdapterValue = Union["CacheDitAdapterConfig", List["CacheDitAdapterConfig"]]

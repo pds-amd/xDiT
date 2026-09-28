@@ -3,14 +3,17 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-from collections import namedtuple
-from typing import Any, Dict, List, Optional, Tuple, Union
+import os
 import pickle
+from collections import namedtuple
+from datetime import timedelta
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
+from torch.profiler import record_function
 
 try:
     import torch_musa
@@ -651,6 +654,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
         local_rank: int,
         torch_distributed_backend: Union[str, Backend],
     ):
+        pipeline_timeout = timedelta(
+            minutes=int(
+                os.getenv("XDIT_PIPELINE_TIMEOUT_MINUTES", "10")
+            )
+        )
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
@@ -660,7 +668,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks,
+                    backend=torch_distributed_backend,
+                    timeout=pipeline_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
@@ -680,10 +690,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
         elif len(group_ranks[0]) == 2:
             for ranks in group_ranks:
                 device_group_0_1 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks,
+                    backend=torch_distributed_backend,
+                    timeout=pipeline_timeout,
                 )
                 device_group_1_0 = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks,
+                    backend=torch_distributed_backend,
+                    timeout=pipeline_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
@@ -722,7 +736,9 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.skip_device_group = None
         for ranks in group_ranks:
             skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks,
+                backend=torch_distributed_backend,
+                timeout=pipeline_timeout,
             )
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
@@ -922,12 +938,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
     def pipeline_isend(
         self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
-    ) -> None:
+    ) -> torch.distributed.Work:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(
             tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
         )
-        self._pipeline_isend(tensor)
+        return self._pipeline_isend(tensor)
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"
@@ -956,7 +972,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
             len(self.receiving_tasks) > 0
         ), "No tasks to receive, call add_pipeline_recv_task first"
         receiving_task = self.receiving_tasks.pop(0)
-        receiving_task[0].wait()
+        with record_function("xdit::pipeline_recv_wait"):
+            receiving_task[0].wait()
         assert (
             receiving_task[1] == name and receiving_task[2] == idx
         ), "Received tensor does not match the requested"

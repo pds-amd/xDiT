@@ -333,7 +333,6 @@ def test_effective_replicated_mode_applies_runtime_exclusions(
     [
         ({"fully_shard_degree": 8}, 8, "--fully_shard_degree"),
         ({"tensor_parallel_degree": 2}, 8, "--tensor_parallel_degree"),
-        ({"pipefusion_parallel_degree": 2}, 8, "--pipefusion_parallel_degree"),
     ],
 )
 def test_a_replicated_request_that_would_be_dropped_is_refused(
@@ -359,6 +358,53 @@ def test_a_replicated_request_that_would_be_dropped_is_refused(
         )
 
     assert expected_in_reason in str(refusal.value)
+
+
+def test_replicated_load_option_is_config_compatible_with_pipefusion(contracts):
+    config = type(
+        "Config",
+        (),
+        {
+            "memory_efficient_sharding": False,
+            "memory_efficient_replicated_load": True,
+            "fully_shard_degree": 1,
+            "pipefusion_parallel_degree": 2,
+            "tensor_parallel_degree": 1,
+        },
+    )()
+
+    contracts.assert_requested_materialization_is_honoured(config, world_size=2)
+    assert contracts.uses_pipeline_stage_meta(config)
+    assert (
+        contracts.select_effective_materialization_mode(
+            config, world_size=2
+        )
+        is contracts.MaterializationMode.EAGER
+    )
+
+
+def test_pipefusion_allows_targeted_fsdp_for_replicated_components(contracts):
+    config = type(
+        "Config",
+        (),
+        {
+            "memory_efficient_sharding": True,
+            "memory_efficient_replicated_load": True,
+            "fully_shard_degree": 2,
+            "fully_shard_components": ["text_encoder"],
+            "pipefusion_parallel_degree": 2,
+            "tensor_parallel_degree": 1,
+        },
+    )()
+
+    contracts.assert_requested_materialization_is_honoured(config, world_size=2)
+    assert contracts.uses_pipeline_stage_meta(config)
+    assert (
+        contracts.select_effective_materialization_mode(
+            config, world_size=2
+        )
+        is contracts.MaterializationMode.FSDP_META
+    )
 
 
 @pytest.mark.parametrize("world_size", [1, 8])
