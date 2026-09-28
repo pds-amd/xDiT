@@ -54,3 +54,23 @@ def test_sd3_pipefusion_preserves_fp16_runtime_contract():
     source = _source(load_model)
 
     assert "torch.float16 if self.config.pipefusion_parallel_degree > 1" in source
+
+
+def test_sd3_rejects_unimplemented_stage_local_replicated_load():
+    module = ast.parse(RUNNER.read_text())
+    runner = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "xFuserStableDiffusionModel"
+    )
+    validator = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_validate_config"
+    )
+    source = _source(validator)
+
+    assert "config.pipefusion_parallel_degree > 1" in source
+    assert "config.memory_efficient_replicated_load" in source
+    assert "does not support" in source

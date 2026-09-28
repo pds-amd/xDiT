@@ -74,6 +74,18 @@ class xFuserStableDiffusionModel(xFuserModel):
         fp8_text_encoder_module_list=["text_encoder_3.encoder.block"],
     )
 
+    def _validate_config(self, config: xFuserArgs) -> None:
+        super()._validate_config(config)
+        if (
+            config.pipefusion_parallel_degree > 1
+            and config.memory_efficient_replicated_load
+        ):
+            raise ValueError(
+                "SD3.5 PipeFusion does not support "
+                "--memory_efficient_replicated_load because its composition "
+                "wrapper cannot construct a stage-local transformer on meta."
+            )
+
     def _load_model(self) -> DiffusionPipeline:
         dtype = (
             torch.float16

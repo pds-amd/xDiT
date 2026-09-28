@@ -403,11 +403,25 @@ class xFuserModel(abc.ABC):
                 dtype=self.engine_config.runtime_config.dtype,
             )
             if is_pipeline_first_stage():
-                group.pipeline_send(token)
-                group.pipeline_recv()
+                group.pipeline_send(
+                    token,
+                    name="_xfuser_compile_prime",
+                    segment_idx=0,
+                )
+                group.pipeline_recv(
+                    idx=0,
+                    name="_xfuser_compile_prime",
+                )
             else:
-                group.pipeline_recv()
-                group.pipeline_send(token)
+                group.pipeline_recv(
+                    idx=0,
+                    name="_xfuser_compile_prime",
+                )
+                group.pipeline_send(
+                    token,
+                    name="_xfuser_compile_prime",
+                    segment_idx=0,
+                )
 
         # Compile and warm the original blocks before cache adapters replace or
         # patch them, keeping stateful cross-step cache logic out of traced graphs.
@@ -746,13 +760,29 @@ class xFuserModel(abc.ABC):
             if component is None:
                 continue
             compile_kwargs = {"mode": mode, "dynamic": dynamic}
-            if self.config.pipefusion_parallel_degree > 1:
+            requested_shards = getattr(
+                self.config,
+                "fully_shard_components",
+                None,
+            )
+            component_is_sharded = (
+                self.config.fully_shard_degree > 1
+                and component_name in self.settings.fsdp_strategy
+                and (
+                    requested_shards is None
+                    or component_name in requested_shards
+                )
+            )
+            if (
+                self.config.pipefusion_parallel_degree > 1
+                and not component_is_sharded
+            ):
                 component.forward = torch.compile(
                     component.forward,
                     **compile_kwargs,
                 )
             elif (
-                self.config.fully_shard_degree > 1
+                component_is_sharded
                 or (
                     self.config.cache_method
                     and self.config.pipefusion_parallel_degree == 1

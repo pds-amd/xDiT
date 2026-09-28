@@ -7,10 +7,12 @@ graph segments that read each other's buffers across steps. One rank, or no shar
 """
 
 from types import SimpleNamespace
+import inspect
 
 import pytest
 import torch
 
+from xfuser.model_executor.models.runner_models import base_model
 from xfuser.model_executor.models.runner_models.base_model import xFuserModel
 from xfuser.core.cache_manager.cache_manager import CacheManager
 
@@ -76,6 +78,31 @@ def test_pipefusion_compiles_the_stage_as_one_boundary(monkeypatch):
 
     assert len(compiled) == 1
     assert compiled[0].__self__ is transformer
+
+
+def test_pipefusion_communicator_priming_uses_a_dedicated_channel():
+    source = inspect.getsource(base_model.xFuserModel.initialize)
+
+    assert 'name="_xfuser_compile_prime"' in source
+    assert "segment_idx=0" in source
+
+
+def test_pipefusion_with_fsdp_compiles_local_blocks(monkeypatch):
+    model, transformer = _model(
+        "default",
+        fully_shard_degree=2,
+        pipefusion_parallel_degree=2,
+    )
+    compiled = []
+
+    def compile_component(component, **kwargs):
+        compiled.append(component)
+        return component
+
+    monkeypatch.setattr(torch, "compile", compile_component)
+    model._compile_model({"num_inference_steps": 4})
+
+    assert compiled == list(transformer.blocks)
 
 
 def test_kv_cache_identity_bookkeeping_stays_outside_dynamo():
