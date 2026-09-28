@@ -402,7 +402,17 @@ class xFuserFlux2Model(xFuserModel):
             return "default"
         return "reduce-overhead"
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
+        # Reference conditioning may add a sequence length that does not divide
+        # evenly across PP patches. Preserve the real token layout rather than
+        # padding synthetic tokens into attention; dynamic compilation avoids a
+        # graph specialization for each uneven patch size.
+        if (
+            self.config.pipefusion_parallel_degree > 1
+            and input_args
+            and input_args.get("input_images")
+        ):
+            return True
         return False
 
     def _load_model(self) -> DiffusionPipeline:
@@ -550,7 +560,7 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             return "default"
         return "reduce-overhead"
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
         return False
 
     def _load_model(self) -> DiffusionPipeline:

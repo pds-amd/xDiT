@@ -45,7 +45,7 @@ def _model(
     )
     model._enable_compute_comm_overlap = lambda: None
     model._get_compile_mode = lambda: mode
-    model._get_compile_dynamic = lambda: False
+    model._get_compile_dynamic = lambda input_args=None: False
     model._get_compiled_pipe_components = lambda: ["transformer"]
     model._get_compile_warmup_steps = lambda input_args: None
     model._run_compile_warmup = lambda input_args: None

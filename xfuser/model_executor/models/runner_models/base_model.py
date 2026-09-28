@@ -689,7 +689,9 @@ class xFuserModel(abc.ABC):
         # CUDA graphs are slow on RDNA4.
         return "default"  # TODO: Configurable
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(
+        self, input_args: Optional[dict] = None
+    ) -> Optional[bool]:
         return None  # torch default (auto)
 
     def _mark_cudagraph_steps(self, component: torch.nn.Module) -> None:
@@ -754,7 +756,7 @@ class xFuserModel(abc.ABC):
         self._enable_compute_comm_overlap()
 
         mode = self._get_compile_mode()
-        dynamic = self._get_compile_dynamic()
+        dynamic = self._get_compile_dynamic(input_args)
         for component_name in self._get_compiled_pipe_components():
             component = getattr(self.pipe, component_name, None)
             if component is None:

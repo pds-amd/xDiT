@@ -10,6 +10,14 @@ import xfuser.model_executor.models.transformers.transformer_flux as transformer
 import xfuser.model_executor.models.transformers.transformer_flux2 as transformer_flux2
 
 
+def test_flux2_reference_pipefusion_uses_dynamic_compile_only_when_needed():
+    model = object.__new__(runner_flux.xFuserFlux2Model)
+    model.config = SimpleNamespace(pipefusion_parallel_degree=2)
+
+    assert model._get_compile_dynamic({"input_images": ["reference.png"]}) is True
+    assert model._get_compile_dynamic({"input_images": []}) is False
+
+
 def test_flux2_uses_atomic_image_and_text_payloads():
     path = (
         Path(__file__).resolve().parents[2]
