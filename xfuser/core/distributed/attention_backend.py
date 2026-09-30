@@ -26,7 +26,6 @@ logger = init_logger(__name__)
 
 ATTENTION_FUNCTION_REGISTRY = {}
 
-
 @dataclass(frozen=True)
 class _AiterMhaV4Capabilities:
     enabled: bool = False
@@ -479,6 +478,33 @@ if env_info["has_aiter"]:
     _TRITON_SSTA_BLOCK_SIZE = 128
     
 
+# FlyDSL FP8 is selected for sufficiently large self-attention. Keep the
+# eligibility policy beside the backend that consumes it.
+def _flydsl_fp8_min_seq(head_dim: int, num_heads: int) -> int:
+    # Measured on gfx1201: D64/H38 and D128/H<=32 flip at S~2560;
+    # D128 high head-count (Wan H40) flips at S~3584.
+    if head_dim >= 128 and num_heads > 32:
+        return 3584
+    return 2560
+
+
+def _flydsl_fp8_eligible(
+    dtype: torch.dtype,
+    query_length: int,
+    key_length: int,
+    num_heads: int,
+    head_dim: int,
+    allow_rectangular_kv: bool = False,
+) -> bool:
+    if dtype != torch.bfloat16:
+        return False
+    if query_length < _flydsl_fp8_min_seq(head_dim, num_heads):
+        return False
+    return query_length == key_length or (
+        allow_rectangular_kv and key_length > query_length
+    )
+
+
 if env_info["has_aiter"]:
     try:
         from aiter.ops.flydsl import flydsl_flash_attn_func as flydsl_flash_attn_func_aiter
@@ -494,14 +520,6 @@ if env_info["has_aiter"]:
         # Two ops mirror the AITER / AITER_FP8 split: AITER_FLYDSL -> xfuser::flydsl_attn (bf16),
         # AITER_FLYDSL_FP8 -> xfuser::flydsl_attn_fp8. fp8 is unfused (faster e2e) so it holds fp8
         # Q/K/V alongside the live bf16 Q/K/V -> higher peak VRAM; pick AITER_FLYDSL when tight.
-
-        # fp8 wins only above a seq crossover (quant pre-pass cost vs K/V HBM bytes saved), which
-        # depends on (head_dim, num_heads). Measured on gfx1201: D64/H38 and D128/H<=32 flip at
-        # S~2560; D128 high head-count (wan H40) at S~3584. Below: fp8 loses 7-18%; above: wins <4%.
-        def _flydsl_fp8_min_seq(head_dim: int, num_heads: int) -> int:
-            if head_dim >= 128 and num_heads > 32:
-                return 3584
-            return 2560
 
         def _flydsl_fp8_attn(query, key, value, is_causal):
             # flydsl_fp8_quant returns fp8 q/k/v + descales (real = fp8 * descale).
@@ -554,25 +572,46 @@ if env_info["has_aiter"]:
             key: torch.Tensor,
             value: torch.Tensor,
             is_causal: bool,
+            allow_rectangular_kv: bool,
         ) -> torch.Tensor:
-            # fp8 only for bf16 self-attn above the crossover; else fall back to the bf16 kernel.
+            # Use FP8 for large self-attention and an explicitly declared
+            # PipeFusion patch-Q/full-KV shape.
             B, S_real, H, D = query.shape
-            is_cross = key.shape[1] != S_real
+            key_length = key.shape[1]
+            is_cross = key_length != S_real
             min_seq = _flydsl_fp8_min_seq(D, H)
-            use_fp8 = query.dtype == torch.bfloat16 and not is_cross and S_real >= min_seq
+            use_fp8 = _flydsl_fp8_eligible(
+                query.dtype,
+                S_real,
+                key_length,
+                H,
+                D,
+                allow_rectangular_kv,
+            )
             if use_fp8:
                 msg = (
-                    f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> fp8 (S>={min_seq}) "
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] "
+                    f"-> fp8 (Sq>={min_seq}) "
                     "(fp8 pre-pass adds a transient QKV copy -> higher peak VRAM)"
                 )
-            elif query.dtype == torch.bfloat16 and not is_cross:
-                msg = f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> bf16 (S<{min_seq})"
+            elif (
+                query.dtype == torch.bfloat16
+                and key_length >= S_real
+                and S_real < min_seq
+            ):
+                msg = (
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] "
+                    f"-> bf16 (Sq<{min_seq})"
+                )
             else:
                 msg = (
-                    f"flydsl attn [B{B} S{S_real} H{H} D{D}] -> bf16 "
+                    f"flydsl attn [B{B} Sq{S_real} Sk{key_length} H{H} D{D}] -> bf16 "
                     f"(not fp8-eligible: dtype={query.dtype}, cross={is_cross})"
                 )
-            _flydsl_log_once((B, S_real, H, D, is_cross, query.dtype), msg)
+            _flydsl_log_once(
+                (B, S_real, key_length, H, D, query.dtype),
+                msg,
+            )
             if use_fp8:
                 return _flydsl_fp8_attn(query, key, value, is_causal)
             return flydsl_flash_attn_func_aiter(
@@ -585,6 +624,7 @@ if env_info["has_aiter"]:
             key: torch.Tensor,
             value: torch.Tensor,
             is_causal: bool,
+            allow_rectangular_kv: bool,
         ) -> torch.Tensor:
             return torch.empty_like(query)
 
@@ -2365,6 +2405,22 @@ def _aiter_flydsl_fp8_attn_call(query, key, value, dropout_p, is_causal, attenti
         return _aiter_flydsl_fp8_prequant_call(
             query, key, value, dropout_p, is_causal, attention_kwargs
         )
+    allow_rectangular_kv = attention_kwargs.get(
+        "pipefusion_rectangular_kv",
+        False,
+    )
     return _aiter_flydsl_dispatch(
-        query, key, value, dropout_p, is_causal, attention_kwargs, torch.ops.xfuser.flydsl_attn_fp8
+        query,
+        key,
+        value,
+        dropout_p,
+        is_causal,
+        attention_kwargs,
+        lambda q, k, v, causal: torch.ops.xfuser.flydsl_attn_fp8(
+            q,
+            k,
+            v,
+            causal,
+            allow_rectangular_kv,
+        ),
     )

@@ -32,6 +32,7 @@ from xfuser.core.distributed.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from xfuser.core.distributed import parallel_state
 from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sequence_parallel_rank,
@@ -42,7 +43,7 @@ from xfuser.core.distributed import (
     get_runtime_state,
 )
 from xfuser.core.cache_manager.cache_manager import get_cache_manager
-from xfuser.core.distributed.parallel_state import _SP
+from xfuser.core.distributed.attention_backend import AttentionBackendType
 from xfuser.envs import PACKAGES_CHECKER
 
 from xfuser.model_executor.layers.usp import USP
@@ -71,13 +72,48 @@ env_info = PACKAGES_CHECKER.get_packages_info()
 HAS_LONG_CTX_ATTN = env_info["has_long_ctx_attn"]
 
 
+def _flux2_pipefusion_attention_backend():
+    """Override FP8 attention only for FLUX.2's synchronous PP cache fill.
+
+    The full-sequence FP8 FlyDSL path is not quality-valid for pure
+    PipeFusion's initial stale-K/V cache fill. Async patches remain on the
+    user-selected FP8 backend, so the policy does not mutate global runtime
+    configuration or discard the low-precision steady-state path.
+    """
+    state = get_runtime_state()
+    if (
+        state.attention_backend == AttentionBackendType.AITER_FLYDSL_FP8
+        and state.num_pipeline_patch > 1
+        and not state.patch_mode
+        and get_sequence_parallel_world_size() == 1
+    ):
+        return AttentionBackendType.AITER_FLYDSL
+    return None
+
+
+def _flux2_pipefusion_attention_kwargs():
+    state = get_runtime_state()
+    if (
+        state.num_pipeline_patch > 1
+        and state.patch_mode
+        and get_sequence_parallel_world_size() == 1
+    ):
+        return {"pipefusion_rectangular_kv": True}
+    return None
+
+
 @xFuserAttentionProcessorRegister.register(Flux2AttnProcessor)
 class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
 
     def __init__(self):
         super().__init__()
-        self.use_long_ctx_attn_kvcache = (
-            HAS_LONG_CTX_ATTN and _SP and get_sequence_parallel_world_size() > 1
+
+    @property
+    def use_long_ctx_attn_kvcache(self):
+        return (
+            HAS_LONG_CTX_ATTN
+            and parallel_state._SP is not None
+            and get_sequence_parallel_world_size() > 1
         )
 
     def __call__(
@@ -161,7 +197,7 @@ class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
 
         # PipeFusion stale-KV: cache image KV per patch, keep encoder (text) KV fresh.
         # Mirrors xFuserFluxAttnProcessor.
-        distri_cache_updated = False
+        pipefusion_kv_cache_updated = False
         if (
             get_runtime_state().num_pipeline_patch > 1
             and not self.use_long_ctx_attn_kvcache
@@ -181,14 +217,17 @@ class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
             )
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
-            distri_cache_updated = True
+            pipefusion_kv_cache_updated = True
 
         # Transpose for attention computation
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        if get_runtime_state().num_pipeline_patch > 1 and not distri_cache_updated:
+        if (
+            get_runtime_state().num_pipeline_patch > 1
+            and not pipefusion_kv_cache_updated
+        ):
             # SP+PP hybrid: split text/image QKV, pass attn_layer for KV buffer
             # (yunchang long-context-attention manages stale-KV across SP ranks)
             if get_runtime_state().split_text_embed_in_sp:
@@ -214,9 +253,22 @@ class xFuserFlux2AttnProcessor(Flux2AttnProcessor):
                 joint_value=joint_v,
                 joint_strategy="front",
                 attn_layer=attn,
+                backend=_flux2_pipefusion_attention_backend(),
+                attention_kwargs=_flux2_pipefusion_attention_kwargs(),
             )
         else:
-            hidden_states = USP(query, key, value, attn_layer=attn)
+            hidden_states = USP(
+                query,
+                key,
+                value,
+                # K/V was updated before USP's all-to-all; passing the layer
+                # would update the same cache a second time.
+                attn_layer=(
+                    None if pipefusion_kv_cache_updated else attn
+                ),
+                backend=_flux2_pipefusion_attention_backend(),
+                attention_kwargs=_flux2_pipefusion_attention_kwargs(),
+            )
 
         # Transpose back to original shape
         hidden_states = hidden_states.transpose(1, 2)
@@ -248,8 +300,13 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
 
     def __init__(self):
         super().__init__()
-        self.use_long_ctx_attn_kvcache = (
-            HAS_LONG_CTX_ATTN and _SP and get_sequence_parallel_world_size() > 1
+
+    @property
+    def use_long_ctx_attn_kvcache(self):
+        return (
+            HAS_LONG_CTX_ATTN
+            and parallel_state._SP is not None
+            and get_sequence_parallel_world_size() > 1
         )
 
     def __call__(
@@ -298,7 +355,7 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
         # Cache only the image portion (text KV stays fresh). MLP part is NOT cached.
         # num_txt_tokens is passed from the transformer wrapper via joint_attention_kwargs.
         num_txt_tokens = kwargs.get("num_txt_tokens", 0)
-        distri_cache_updated = False
+        pipefusion_kv_cache_updated = False
         if (
             get_runtime_state().num_pipeline_patch > 1
             and not self.use_long_ctx_attn_kvcache
@@ -325,7 +382,7 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
                     slice_dim=1,
                     layer_type="attn",
                 )
-            distri_cache_updated = True
+            pipefusion_kv_cache_updated = True
 
         # Transpose for attention computation
         query = query.transpose(1, 2)
@@ -334,7 +391,7 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
 
         if (
             get_runtime_state().num_pipeline_patch > 1
-            and not distri_cache_updated
+            and not pipefusion_kv_cache_updated
             and num_txt_tokens > 0
         ):
             # SP+PP hybrid: split text/image QKV, pass attn_layer for KV buffer
@@ -359,10 +416,22 @@ class xFuserFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
                 joint_strategy="front",
                 attn_layer=attn,
                 combine_qkv_a2a=True,
+                backend=_flux2_pipefusion_attention_backend(),
+                attention_kwargs=_flux2_pipefusion_attention_kwargs(),
             )
         else:
             hidden_states = USP(
-                query, key, value, combine_qkv_a2a=True, attn_layer=attn
+                query,
+                key,
+                value,
+                combine_qkv_a2a=True,
+                # K/V was updated before USP's all-to-all; passing the layer
+                # would update the same cache a second time.
+                attn_layer=(
+                    None if pipefusion_kv_cache_updated else attn
+                ),
+                backend=_flux2_pipefusion_attention_backend(),
+                attention_kwargs=_flux2_pipefusion_attention_kwargs(),
             )
 
         # Transpose back to original shape
@@ -598,9 +667,15 @@ class xFuserFlux2Transformer2DModelWrapper(xFuserTransformerBaseWrapper):
         **kwargs,
     ):
         # 1. timestep embedding + modulation (cheap; depends only on timestep)
-        timestep = timestep.to(hidden_states.dtype) * 1000
+        compute_dtype = next(self.time_guidance_embed.parameters()).dtype
+        hidden_states = hidden_states.to(dtype=compute_dtype)
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.to(
+                dtype=compute_dtype
+            )
+        timestep = timestep.to(compute_dtype) * 1000
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance.to(compute_dtype) * 1000
         temb = self.time_guidance_embed(timestep, guidance)
         double_stream_mod_img = self.double_stream_modulation_img(temb)
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)

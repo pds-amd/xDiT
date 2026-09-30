@@ -5,6 +5,9 @@ from xfuser.model_executor.cache import (
     DBCachePreset,
     CacheDitAdapterConfig,
     DBCacheSettings,
+    PipeFusionCachePlan,
+    PipeFusionStaticMask,
+    PipeFusionTopology,
 )
 from xfuser.model_executor.models.runner_models.base_model import (
     xFuserModel,
@@ -19,13 +22,15 @@ from xfuser.core.utils.runner_utils import (
     log,
     resize_and_crop_image,
 )
-from xfuser.core.distributed import get_runtime_state, get_pipeline_parallel_world_size
+from xfuser.core.distributed import (
+    get_runtime_state,
+    get_pipeline_parallel_world_size,
+)
 from xfuser import xFuserFluxPipeline
 from xfuser.model_executor.models.runner_models.loading.contracts import (
     LoadSupport,
     STANDARD_LOAD_ROUTES,
 )
-
 
 @register_model("black-forest-labs/FLUX.1-dev")
 @register_model("FLUX.1-dev")
@@ -82,9 +87,79 @@ class xFuserFluxModel(xFuserModel):
             "teacache": None,
             "dbcache": DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
-                    blocks=(("transformer_blocks", "Pattern_1"), ("single_transformer_blocks", "Pattern_1")),
+                    blocks=(
+                        ("transformer_blocks", "Pattern_1"),
+                        ("single_transformer_blocks", "Pattern_1"),
+                    ),
                 ),
-                preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.12, scm_policy="ultra"),
+                preset=DBCachePreset(
+                    Fn_compute_blocks=2,
+                    residual_diff_threshold=0.12,
+                    scm_policy="ultra",
+                ),
+                pipefusion_cache_plans=(
+                    PipeFusionCachePlan.full_stage_output(
+                        min_inference_steps=25,
+                        max_inference_steps=25,
+                        topologies=(
+                            PipeFusionTopology(
+                                pp_degree=2,
+                                num_pipeline_patches=2,
+                                attn_layer_num_for_pp=(29, 28),
+                            ),
+                            PipeFusionTopology(
+                                pp_degree=4,
+                                num_pipeline_patches=4,
+                                attn_layer_num_for_pp=(14, 14, 14, 15),
+                            ),
+                        ),
+                    ),
+                    # The balanced PP2 split is benchmarked only. Keep
+                    # full-stage reuse opt-in until its output quality is
+                    # validated against the default split.
+                    PipeFusionCachePlan.full_stage_output(
+                        min_inference_steps=25,
+                        max_inference_steps=25,
+                        auto_select=False,
+                        static_mask=PipeFusionStaticMask.WIDE_ALTERNATING_MIDDLE,
+                        topologies=(
+                            PipeFusionTopology(
+                                pp_degree=2,
+                                num_pipeline_patches=2,
+                                attn_layer_num_for_pp=(28, 29),
+                            ),
+                            PipeFusionTopology(
+                                pp_degree=2,
+                                num_pipeline_patches=4,
+                                attn_layer_num_for_pp=(28, 29),
+                            ),
+                        ),
+                    ),
+                    PipeFusionCachePlan.intermediate_stage_output(
+                        min_inference_steps=25,
+                        max_inference_steps=25,
+                        auto_select=False,
+                        tail_compute_blocks=1,
+                        topologies=(
+                            PipeFusionTopology(
+                                pp_degree=2,
+                                num_pipeline_patches=2,
+                                attn_layer_num_for_pp=(29, 28),
+                            ),
+                            PipeFusionTopology(
+                                pp_degree=4,
+                                num_pipeline_patches=4,
+                                attn_layer_num_for_pp=(14, 14, 14, 15),
+                            ),
+                            PipeFusionTopology(
+                                pp_degree=2,
+                                num_pipeline_patches=2,
+                                attn_layer_num_for_pp=(28, 29),
+                            ),
+                        ),
+                    ),
+                    PipeFusionCachePlan.block_local(),
+                ),
             ),
         },
     )
@@ -96,11 +171,31 @@ class xFuserFluxModel(xFuserModel):
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            from diffusers.models.transformers.transformer_flux import (
+                FluxTransformer2DModel,
+            )
+
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    FluxTransformer2DModel
+                )
+            )
             pipe = xFuserFluxPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=torch.float16,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from diffusers import FluxPipeline
             from xfuser.model_executor.models.transformers.transformer_flux import (
@@ -331,9 +426,19 @@ class xFuserFlux2Model(xFuserModel):
             "fbcache": None,
             "dbcache": DBCacheSettings(
                 adapter=CacheDitAdapterConfig(
-                    blocks=(("transformer_blocks", "Pattern_1"), ("single_transformer_blocks", "Pattern_2")),
+                    blocks=(
+                        ("transformer_blocks", "Pattern_1"),
+                        ("single_transformer_blocks", "Pattern_2"),
+                    ),
                 ),
-                preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.12, scm_policy="ultra"),
+                preset=DBCachePreset(
+                    Fn_compute_blocks=2,
+                    residual_diff_threshold=0.12,
+                    scm_policy="ultra",
+                ),
+                pipefusion_cache_plans=(
+                    PipeFusionCachePlan.block_local(),
+                ),
             ),
         },
     )
@@ -348,20 +453,49 @@ class xFuserFlux2Model(xFuserModel):
             return "default"
         return "reduce-overhead"
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
+        # Reference conditioning may add a sequence length that does not divide
+        # evenly across PP patches. Preserve the real token layout rather than
+        # padding synthetic tokens into attention; dynamic compilation avoids a
+        # graph specialization for each uneven patch size.
+        if (
+            self.config.pipefusion_parallel_degree > 1
+            and input_args
+            and input_args.get("input_images")
+        ):
+            return True
         return False
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            from diffusers.models.transformers.transformer_flux2 import (
+                Flux2Transformer2DModel,
+            )
             from xfuser.model_executor.pipelines.pipeline_flux2 import (
                 xFuserFlux2Pipeline,
             )
 
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    Flux2Transformer2DModel
+                )
+            )
             pipe = xFuserFlux2Pipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=self.engine_config.runtime_config.dtype,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from xfuser.model_executor.models.transformers.transformer_flux2 import (
                 xFuserFlux2Transformer2DWrapper,
@@ -476,20 +610,39 @@ class xFuserFlux2Klein9BModel(xFuserModel):
             return "default"
         return "reduce-overhead"
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(self, input_args=None) -> Optional[bool]:
         return False
 
     def _load_model(self) -> DiffusionPipeline:
         if self.config.pipefusion_parallel_degree > 1:
+            dtype = (
+                torch.bfloat16
+                if PACKAGES_CHECKER._on_rdna4()
+                else torch.float16
+            )
+            self.engine_config.runtime_config.dtype = dtype
+            from diffusers.models.transformers.transformer_flux2 import (
+                Flux2Transformer2DModel,
+            )
             from xfuser.model_executor.pipelines.pipeline_flux2 import (
                 xFuserFlux2KleinPipeline,
             )
 
+            transformer, pipeline_kwargs = (
+                self.loader.plan_pipefusion_components(
+                    Flux2Transformer2DModel
+                )
+            )
             pipe = xFuserFlux2KleinPipeline.from_pretrained(
                 pretrained_model_name_or_path=self.settings.model_name,
-                torch_dtype=self.engine_config.runtime_config.dtype,
+                torch_dtype=dtype,
                 engine_config=self.engine_config,
+                **pipeline_kwargs,
             )
+            if transformer is not None:
+                self.loader.mark_pipeline_stage_blockwise(
+                    pipe.transformer, transformer
+                )
         else:
             from xfuser.model_executor.models.transformers.transformer_flux2 import (
                 xFuserFlux2Transformer2DWrapper,

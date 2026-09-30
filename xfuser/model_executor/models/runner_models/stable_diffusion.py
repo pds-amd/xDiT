@@ -5,6 +5,7 @@ from xfuser.model_executor.cache import (
     DBCachePreset,
     CacheDitAdapterConfig,
     DBCacheSettings,
+    PipeFusionCachePlan,
 )
 from xfuser import xFuserStableDiffusion3Pipeline
 from xfuser.model_executor.models.runner_models.base_model import (
@@ -24,7 +25,6 @@ from xfuser.model_executor.models.runner_models.loading.contracts import (
 @register_model("stable-diffusion-3.5-large")
 @register_model("SD3.5")
 class xFuserStableDiffusionModel(xFuserModel):
-    # The composition wrapper has no config-only transformer construction seam.
     load_support = LoadSupport(
         meta_transformers=(),
         meta_text_encoders=(),
@@ -70,16 +70,32 @@ class xFuserStableDiffusionModel(xFuserModel):
                     blocks=(("transformer_blocks", "Pattern_1"),),
                 ),
                 preset=DBCachePreset(Fn_compute_blocks=2, residual_diff_threshold=0.08, scm_policy="fast", enable_encoder_calibrator=False),
+                pipefusion_cache_plans=(
+                    PipeFusionCachePlan.block_local(),
+                ),
             ),
         },
         fp8_text_encoder_module_list=["text_encoder_3.encoder.block"],
     )
 
+    def _validate_config(self, config: xFuserArgs) -> None:
+        super()._validate_config(config)
+        if (
+            config.pipefusion_parallel_degree > 1
+            and config.memory_efficient_replicated_load
+        ):
+            raise ValueError(
+                "SD3.5 PipeFusion does not support "
+                "--memory_efficient_replicated_load because its composition "
+                "wrapper cannot construct a stage-local transformer on meta."
+            )
+
     def _load_model(self) -> DiffusionPipeline:
-        # SD3's wrapper is composition-style (wraps a transformer instance) and lacks
-        # ConfigMixin.load_config, so it cannot be built on meta like flux/z_image. Load real on
-        # every rank; the per-rank AITER fp8 walk quantizes the real weights CPU->GPU afterwards.
-        dtype = torch.float16 if self.config.pipefusion_parallel_degree > 1 else torch.bfloat16
+        dtype = (
+            torch.float16
+            if self.config.pipefusion_parallel_degree > 1
+            else torch.bfloat16
+        )
         return xFuserStableDiffusion3Pipeline.from_pretrained(
             pretrained_model_name_or_path=self.settings.model_name,
             engine_config=self.engine_config,

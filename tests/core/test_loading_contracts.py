@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from xfuser.model_executor.models.runner_models.loading import shard
+
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACTS_PATH = (
     ROOT / "xfuser/model_executor/models/runner_models/loading/contracts.py"
@@ -333,7 +335,6 @@ def test_effective_replicated_mode_applies_runtime_exclusions(
     [
         ({"fully_shard_degree": 8}, 8, "--fully_shard_degree"),
         ({"tensor_parallel_degree": 2}, 8, "--tensor_parallel_degree"),
-        ({"pipefusion_parallel_degree": 2}, 8, "--pipefusion_parallel_degree"),
     ],
 )
 def test_a_replicated_request_that_would_be_dropped_is_refused(
@@ -359,6 +360,81 @@ def test_a_replicated_request_that_would_be_dropped_is_refused(
         )
 
     assert expected_in_reason in str(refusal.value)
+
+
+def test_replicated_load_option_is_config_compatible_with_pipefusion(contracts):
+    config = type(
+        "Config",
+        (),
+        {
+            "memory_efficient_sharding": False,
+            "memory_efficient_replicated_load": True,
+            "fully_shard_degree": 1,
+            "pipefusion_parallel_degree": 2,
+            "tensor_parallel_degree": 1,
+        },
+    )()
+
+    contracts.assert_requested_materialization_is_honoured(config, world_size=2)
+    assert contracts.uses_pipeline_stage_meta(config)
+    assert (
+        contracts.select_effective_materialization_mode(
+            config, world_size=2
+        )
+        is contracts.MaterializationMode.EAGER
+    )
+
+
+def test_pipefusion_allows_targeted_fsdp_for_replicated_components(contracts):
+    config = type(
+        "Config",
+        (),
+        {
+            "memory_efficient_sharding": True,
+            "memory_efficient_replicated_load": True,
+            "fully_shard_degree": 2,
+            "fully_shard_components": ["text_encoder"],
+            "pipefusion_parallel_degree": 2,
+            "tensor_parallel_degree": 1,
+        },
+    )()
+
+    contracts.assert_requested_materialization_is_honoured(config, world_size=2)
+    assert contracts.uses_pipeline_stage_meta(config)
+    assert (
+        contracts.select_effective_materialization_mode(
+            config, world_size=2
+        )
+        is contracts.MaterializationMode.FSDP_META
+    )
+
+
+def test_stage_local_pipefusion_components_are_never_default_fsdp_targets(
+    monkeypatch,
+):
+    group = type("Group", (), {"local_rank": 0, "device_group": object()})()
+    model = type(
+        "Model",
+        (),
+        {
+            "config": type("Config", (), {"fully_shard_components": None})(),
+            "settings": type("Settings", (), {"fsdp_strategy": {"transformer": {}}})(),
+            "pipe": type("Pipe", (), {"components": {"transformer": object()}})(),
+        },
+    )()
+    loader = type(
+        "Loader",
+        (),
+        {
+            "model": model,
+            "is_pipeline_stage_blockwise": staticmethod(lambda _component: True),
+        },
+    )()
+    monkeypatch.setattr(shard, "get_world_group", lambda: group)
+    monkeypatch.setattr(shard, "get_fs_group", lambda: group)
+
+    with pytest.raises(ValueError, match="stage-local components"):
+        shard.shard_pipeline_components(loader)
 
 
 @pytest.mark.parametrize("world_size", [1, 8])

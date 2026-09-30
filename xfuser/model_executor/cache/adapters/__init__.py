@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from xfuser.model_executor.cache.presets import PipeFusionCachePlan
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +56,8 @@ def apply_cache(
     cache_config: Optional[str] = None,
     # CacheDitAdapterConfig or List[CacheDitAdapterConfig], dbcache only
     adapter_config: Optional[Any] = None,
+    # Model-owned PipeFusion policy; never parsed from CLI JSON.
+    pipefusion_cache_plan: Optional[PipeFusionCachePlan] = None,
     # Transformer attribute name on pipe, used for teacache/fbcache
     transformer_attr: str = "transformer",
 ) -> Optional[Any]:
@@ -118,6 +122,7 @@ def apply_cache(
                 adapter_configs=adapter_config,
                 presets=preset_kwargs,
                 cache_config=cache_config,
+                pipefusion_cache_plan=pipefusion_cache_plan,
             )
             return
         attr = adapter_config.transformer_attr if adapter_config else transformer_attr
@@ -134,6 +139,7 @@ def apply_cache(
             preset_kwargs=preset_kwargs,
             cache_config=cache_config,
             adapter_config=adapter_config,
+            pipefusion_cache_plan=pipefusion_cache_plan,
         )
         if transformer is None:
             setattr(pipe, attr, patched)

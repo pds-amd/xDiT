@@ -508,11 +508,19 @@ class ModelLoader:
                 or config.tensor_parallel_degree > 1
             )
             if splits_weights_per_rank:
-                log(
-                    "--memory_efficient_replicated_load ignored: this run splits weights per rank "
-                    "(FSDP/PipeFusion/tensor parallel), so peers hold different weights than rank0 and "
-                    "a broadcast would overwrite them. Loading per rank."
-                )
+                if config.pipefusion_parallel_degree > 1:
+                    log(
+                        "--memory_efficient_replicated_load uses stage-local "
+                        "transformer loading under PipeFusion; replicated "
+                        "pipeline components still load per rank."
+                    )
+                else:
+                    log(
+                        "--memory_efficient_replicated_load ignored: this run "
+                        "splits weights per rank (FSDP/tensor parallel), so peers "
+                        "hold different weights than rank0 and a broadcast would "
+                        "overwrite them. Loading per rank."
+                    )
             elif world_size == 1:
                 log(
                     "--memory_efficient_replicated_load ignored: single-rank run has no peer to "
@@ -572,12 +580,43 @@ class ModelLoader:
             raise RuntimeError("local blockwise transformer was not built on meta")
         self._local_blockwise_transformers[component] = True
 
+    def mark_pipeline_stage_blockwise(
+        self, stage_component, source_component
+    ) -> None:
+        """Transfer a meta transformer's checkpoint source to its PP wrapper."""
+        source = self._blockwise_sources.pop(source_component, None)
+        if source is None:
+            raise RuntimeError(
+                "pipeline stage transformer was not built on meta"
+            )
+        self._blockwise_sources[stage_component] = source
+        self._local_blockwise_transformers[stage_component] = True
+        stage_component._xfuser_pipeline_stage_partial = True
+
     def load_transformer(self, wrapper_cls, **kwargs):
         """Route one transformer's weights onto the device (see transformer_load)."""
 
         from .transformer_load import load_transformer
 
         return load_transformer(self, wrapper_cls, **kwargs)
+
+    def plan_pipefusion_components(self, transformer_cls):
+        """Plan stage-local transformer and replicated text components."""
+        if self.model.config.pipefusion_parallel_degree <= 1:
+            raise RuntimeError(
+                "PipeFusion component planning requires pipeline parallelism"
+            )
+        transformer = None
+        if self.model.config.memory_efficient_replicated_load:
+            transformer = self.load_transformer(transformer_cls)
+        text_kwargs, quantization_config = self.plan_text_encoders()
+        pipeline_kwargs = {
+            "quantization_config": quantization_config,
+            **text_kwargs,
+        }
+        if transformer is not None:
+            pipeline_kwargs["transformer"] = transformer
+        return transformer, pipeline_kwargs
 
     def plan_text_encoders(self, existing_quantization_config=None):
         """Plan each declared text encoder's quantization and fill (see text_encoder_plan)."""
@@ -598,12 +637,14 @@ class ModelLoader:
 
             place_pipeline_components(self)
 
-    def fill_eager_transformers(self) -> None:
+    def fill_eager_transformers(self, component_names=None) -> None:
         """Fill all component-level eager blockwise plans before device placement."""
 
         local_rank = get_world_group().local_rank
         device = f"cuda:{local_rank}"
         for name, component in self.model.pipe.components.items():
+            if component_names is not None and name not in component_names:
+                continue
             if component not in self._local_blockwise_transformers:
                 continue
             strategy = self.model.settings.fsdp_strategy[name]
@@ -619,6 +660,9 @@ class ModelLoader:
                 f"host {host_mem_gb()} GB, "
                 f"VRAM {torch.cuda.memory_allocated()/1e9:.2f}GB"
             )
+
+    def is_pipeline_stage_blockwise(self, component) -> bool:
+        return component in self._local_blockwise_transformers
 
     def build_meta_transformer(
         self,
@@ -1536,7 +1580,9 @@ class _BlockwiseDiskFiller:
         self._id2fqn: dict[int, str] = {}
         for attr in wrap_attrs:
             for idx, mod in enumerate(rgetattr(component, attr)):
-                self._id2fqn[id(mod)] = f"{attr}.{idx}"
+                self._id2fqn[id(mod)] = getattr(
+                    mod, "_xfuser_checkpoint_fqn", f"{attr}.{idx}"
+                )
 
     @contextmanager
     def _timed(self, phase: str):
@@ -2022,7 +2068,9 @@ class _BlockwiseDiskFiller:
                     [rgetattr(comp, name).data for name in tail + tail_bufs]
                 )
         self._retire_keys([self._ckpt_key(comp, name) for name in tail + tail_bufs])
-        if self.strict:
+        if self.strict and not getattr(
+            comp, "_xfuser_pipeline_stage_partial", False
+        ):
             unused = sorted(set(self.weight_map) - self._used_keys)
             if unused:
                 preview = ", ".join(unused[:3])
@@ -2032,6 +2080,13 @@ class _BlockwiseDiskFiller:
                     f"{preview}{suffix}"
                 )
         self._retie_weights(comp)
+        if getattr(comp, "_xfuser_pipeline_stage_partial", False):
+            delattr(comp, "_xfuser_pipeline_stage_partial")
+            for attr in getattr(self, "_block_prefixes", ()):
+                block_attr = attr[:-1]
+                for block in rgetattr(comp, block_attr):
+                    if hasattr(block, "_xfuser_checkpoint_fqn"):
+                        delattr(block, "_xfuser_checkpoint_fqn")
         self._release_handles()
         # Before the drop, not after: a prefetch still streaming would put back the cache this is
         # about to release. Joining here rather than in _release_handles is what keeps the prefetch

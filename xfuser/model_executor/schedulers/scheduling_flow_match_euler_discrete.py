@@ -78,11 +78,19 @@ class xFuserFlowMatchEulerDiscreteSchedulerWrapper(xFuserSchedulerBaseWrapper):
 
         sigma = self.sigmas[self.step_index]
 
-        gamma = (
-            min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1)
-            if s_tmin <= sigma <= s_tmax
-            else 0.0
-        )
+        # ``sigma`` is a device tensor. The usual inference path uses the
+        # default ``s_churn=0`` and therefore has gamma=0 by definition; avoid
+        # evaluating the Python chained comparison on a CUDA scalar once per
+        # PipeFusion patch. Nonzero churn retains diffusers' original bounds
+        # check and is an uncommon stochastic-sampling path.
+        if s_churn == 0.0:
+            gamma = 0.0
+        else:
+            gamma = (
+                min(s_churn / (len(self.sigmas) - 1), 2**0.5 - 1)
+                if s_tmin <= sigma <= s_tmax
+                else 0.0
+            )
 
         noise = randn_tensor(
             model_output.shape,

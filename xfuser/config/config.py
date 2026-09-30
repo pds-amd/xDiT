@@ -60,6 +60,8 @@ class RuntimeConfig:
     use_cuda_graph: bool = False
     use_hybrid_attn_schedule: bool = False
     use_parallel_vae: bool = False
+    runner_managed_parallel_vae: bool = False
+    runner_managed_torch_compile: bool = False
     use_profiler: bool = False
     use_torch_compile: bool = False
     use_onediff: bool = False

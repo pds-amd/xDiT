@@ -96,8 +96,16 @@ class Fp8CommsState:
         if not runtime_config.use_fp8_comms:
             return None
         ulysses_degree = config.parallel_config.sp_config.ulysses_degree or 1
+        pipefusion_degree = config.parallel_config.pp_config.pp_degree or 1
+        if pipefusion_degree > 1 and ulysses_degree <= 1:
+            raise ValueError(
+                "--use_fp8_comms does not support pure PipeFusion because its "
+                "P2P stage transport has no FP8 wire protocol."
+            )
         if ulysses_degree <= 1:
-            raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
+            raise ValueError(
+                "--use_fp8_comms requires ulysses_degree > 1."
+            )
         scale = runtime_config.fp8_comms_scale
         safety_factor = runtime_config.fp8_comms_safety_factor
         if scale is not None:
@@ -547,12 +555,20 @@ def validate_fp8_comms_config(config, capabilities, settings) -> None:
 
     if not capabilities.use_fp8_comms:
         raise ValueError(f"Model {settings.model_name} does not support --use_fp8_comms.")
-    if getattr(config, "pipefusion_parallel_degree", 1) > 1:
+    pipefusion = getattr(config, "pipefusion_parallel_degree", 1) > 1
+    ulysses = config.ulysses_degree or 1
+    if pipefusion:
+        if ulysses > 1:
+            raise ValueError(
+                "--use_fp8_comms does not support hybrid PipeFusion + Ulysses "
+                "because its joint-attention path cannot mix FP8 communication "
+                "tensors with BF16 joint tensors."
+            )
         raise ValueError(
-            "--use_fp8_comms does not support PipeFusion because its joint-attention "
-            "path cannot mix FP8 communication tensors with BF16 joint tensors."
+            "--use_fp8_comms does not support pure PipeFusion because its "
+            "P2P stage transport has no FP8 wire protocol."
         )
-    if (config.ulysses_degree or 1) <= 1:
+    if ulysses <= 1:
         raise ValueError("--use_fp8_comms requires ulysses_degree > 1.")
     if (
         config.enable_sequential_cpu_offload

@@ -273,6 +273,7 @@ class xFuserArgs:
     dataset_path: Optional[str] = None
     use_fsdp: bool = False
     fully_shard_degree: int = 1
+    fully_shard_components: Optional[List[str]] = None
     reshard_after_forward: bool = True
     memory_efficient_sharding: bool = False
     memory_efficient_replicated_load: bool = False
@@ -320,6 +321,19 @@ class xFuserArgs:
                 "--profile_with_stack has no effect without --profile; "
                 "no profiles will be outputted."
             )
+        if self.fully_shard_components is not None:
+            self.fully_shard_components = list(
+                dict.fromkeys(self.fully_shard_components)
+            )
+            if not self.fully_shard_components:
+                raise ValueError(
+                    "--fully_shard_components requires at least one component"
+                )
+            if self.fully_shard_degree <= 1:
+                raise ValueError(
+                    "--fully_shard_components requires "
+                    "--fully_shard_degree greater than 1"
+                )
         self._resolve_gemm_quantization()
         if self.cache_method is None:
             if self.use_fbcache:
@@ -855,6 +869,22 @@ class xFuserArgs:
             help="Pipefusion parallel degree. Indicates the number of pipeline stages.",
         )
         parser.add_argument(
+            "--num_pipeline_patch",
+            type=int,
+            default=None,
+            help="Number of patches the feature map should be segmented in pipefusion parallel.",
+        )
+        parser.add_argument(
+            "--attn_layer_num_for_pp",
+            default=None,
+            nargs="*",
+            type=int,
+            help="List representing the number of layers per stage of the pipeline in pipefusion parallel",
+        )
+        parser.add_argument(
+            "--warmup_steps", type=int, default=1, help="Warmup steps in generation."
+        )
+        parser.add_argument(
             "--tensor_parallel_degree",
             type=int,
             default=1,
@@ -871,6 +901,16 @@ class xFuserArgs:
             type=int,
             default=1,
             help="Fully sharding (sharding) degree."
+        )
+        parser.add_argument(
+            "--fully_shard_components",
+            nargs="+",
+            default=None,
+            help=(
+                "Only FSDP-wrap these pipeline components (for example "
+                "'text_encoder'). By default every component named by the "
+                "model's FSDP strategy is sharded."
+            ),
         )
         parser.add_argument(
             "--no_reshard_after_forward",
@@ -897,8 +937,9 @@ class xFuserArgs:
                  "(pure sequence/CFG/data parallelism): rank0 loads the real weights and peers "
                  "build on meta and receive them over a GPU->GPU broadcast, so host peak is 1x the "
                  "model instead of Nx. Use if the load is OOM-killed on host as rank count grows. "
-                 "No effect with weight-splitting parallelism (FSDP/PipeFusion/tensor parallel), "
-                 "which loads per-rank weights anyway, or on a single rank.",
+                 "With PipeFusion, this instead enables stage-local transformer loading and can be "
+                 "combined with --fully_shard_components for replicated components. It has no "
+                 "effect with other weight-splitting parallelism or on a single rank.",
         )
         parser.add_argument(
             "--height",

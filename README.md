@@ -218,12 +218,9 @@ The runner does not support all older models. For those we have the example scri
 
 #### Using example scripts
 
-We provide examples demonstrating how to run models with xDiT in the [./examples/](./examples/) directory.
-You can easily modify the model type, model directory, and parallel options in the [examples/run.sh](examples/run.sh) within the script to run some already supported DiT models.
-
-```bash
-bash examples/run.sh
-```
+We provide direct model examples in the [./examples/](./examples/) directory.
+Use the script matching the model you want to run, or use the
+[model runner](docs/runner/runner.md) for the supported runner interface.
 
 Hybridizing multiple parallelism techniques together is essential for efficiently scaling.
 It's important that **the product of all parallel degrees matches the number of devices**.
@@ -238,14 +235,12 @@ examples/pixartalpha_example.py \
 --pipefusion_parallel_degree 2 \
 --ulysses_degree 2 \
 --num_inference_steps 20 \
---warmup_steps 0 \
+--warmup_steps 1 \
 --prompt "A cute dog" \
 --use_cfg_parallel
 ```
 
-⚠️ Applying PipeFusion requires setting `warmup_steps`, also required in DistriFusion, typically set to a small number compared with `num_inference_steps`.
-The warmup step impacts the efficiency of PipeFusion as it cannot be executed in parallel, thus degrading to a serial execution.
-We observed that a warmup of 0 had no effect on the PixArt model.
+⚠️ Applying PipeFusion requires setting `warmup_steps`, typically to a small number compared with `num_inference_steps`. These initial steps run synchronously, so increasing the value reduces pipeline efficiency.
 Users can tune this value according to their specific tasks.
 
 ### 5. Launch an HTTP Service
@@ -417,12 +412,16 @@ pip install onediff
 pip install -U nexfort
 ```
 
-For usage instructions, refer to the [example/run.sh](./examples/run.sh). Simply append `--use_torch_compile` or `--use_onediff` to your command. Note that these options are mutually exclusive, and their performance varies across different scenarios.
+For model-runner options, refer to the [runner documentation](docs/runner/runner.md).
+`--use_torch_compile` and `--use_onediff` are mutually exclusive, and their
+performance varies across scenarios.
 
 <h4 id="cache_acceleration">Cache Acceleration</h4>
 
-You can use `--use_teacache` or `--use_fbcache` in examples/run.sh, which applies TeaCache and First-Block-Cache respectively.
-Note, cache method is only supported for FLUX model with USP. It is currently not applicable for PipeFusion.
+The model runner supports DBCache through `--cache_method dbcache`. This
+PipeFusion work adds model-owned cache plans: adaptive per-block DBCache is
+the default, while stage-payload reuse is an explicit quality-validated policy
+for the models that support it.
 
 xDiT also provides DiTFastAttn for single GPU acceleration. It can reduce the computation cost of attention layers by leveraging redundancies between different steps of the Diffusion Model.
 

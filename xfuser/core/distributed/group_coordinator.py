@@ -3,9 +3,9 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import pickle
 from collections import namedtuple
 from typing import Any, Dict, List, Optional, Tuple, Union
-import pickle
 
 import torch
 import torch.distributed
@@ -712,6 +712,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_shape: Dict[str, Dict[int, torch.Size]] = {}
         self.send_shape: Dict[str, Dict[int, torch.Size]] = {}
         self.recv_buffer: Dict[str, Dict[int, torch.Size]] = {}
+        self.fixed_payload_names = set()
 
         self.skip_tensor_recv_buffer_set: bool = False
         self.recv_skip_tasks_queue: List[Union[int, Tuple[str, int]]] = []
@@ -734,6 +735,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_shape = {}
         self.send_shape = {}
         self.recv_buffer = {}
+        self.fixed_payload_names = set()
 
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
@@ -741,6 +743,27 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype
+
+    def set_fixed_payload_buffers(
+        self,
+        name: str,
+        *,
+        send_shapes: List[torch.Size],
+        recv_shapes: List[torch.Size],
+        dtype: torch.dtype,
+    ) -> None:
+        """Register static per-patch wire shapes before PipeFusion starts."""
+        self.send_shape[name] = {
+            index: torch.Size(shape) for index, shape in enumerate(send_shapes)
+        }
+        self.recv_shape[name] = {
+            index: torch.Size(shape) for index, shape in enumerate(recv_shapes)
+        }
+        self.recv_buffer[name] = {
+            index: torch.zeros(shape, device=self.device, dtype=dtype)
+            for index, shape in enumerate(recv_shapes)
+        }
+        self.fixed_payload_names.add(name)
 
     def set_recv_buffer(
         self,
@@ -785,6 +808,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
     ):
         send_flag = False
         name = name or "latent"
+        if name in self.fixed_payload_names:
+            return
         if tensor_send_to_next is not None:
             shape_list = self.send_shape.get(name, None)
             if shape_list is None:
@@ -922,12 +947,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
     def pipeline_isend(
         self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1
-    ) -> None:
+    ) -> torch.distributed.Work:
         tensor = tensor.contiguous()
         self._check_shape_and_buffer(
             tensor_send_to_next=tensor, name=name, segment_idx=segment_idx
         )
-        self._pipeline_isend(tensor)
+        return self._pipeline_isend(tensor)
 
     def pipeline_recv(self, idx: int = -1, name: str = "latent") -> torch.Tensor:
         name = name or "latent"

@@ -31,7 +31,11 @@ from xfuser.model_executor.models.runner_models.vae_manager import (
     validate_vae_config,
 )
 
-from xfuser.model_executor.cache.presets import DBCacheSettings, ModelCacheConfig
+from xfuser.model_executor.cache.presets import (
+    DBCacheSettings,
+    ModelCacheConfig,
+    PipeFusionCacheUnit,
+)
 from xfuser.core.distributed import (
     get_world_group,
     get_model_replica_group,
@@ -40,6 +44,8 @@ from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_classifier_free_guidance_rank,
     get_pipeline_parallel_world_size,
+    get_pp_group,
+    is_pipeline_first_stage,
     initialize_runtime_state,
     get_runtime_state,
     runtime_state_is_initialized,
@@ -354,6 +360,15 @@ class xFuserModel(abc.ABC):
 
         self.loader.preflight(world_size=get_world_group().world_size)
         self.engine_config, _ = self.config.create_config()
+        # Runner-managed VAE setup happens after the pipeline is loaded, where
+        # VAEManager can choose row sharding or whole-tile distribution. Legacy
+        # xFuser pipeline wrappers otherwise parallelize the decoder during
+        # construction and VAEManager would wrap that decoder a second time.
+        self.engine_config.runtime_config.runner_managed_parallel_vae = True
+        # The runner applies its model-specific compile mode after loading. Avoid
+        # compiling the legacy pipeline wrapper's forward first and then wrapping
+        # that compiled callable in a second torch.compile layer.
+        self.engine_config.runtime_config.runner_managed_torch_compile = True
         log("Loading model pipeline...")
         self.pipe = self._load_model_checked()
 
@@ -375,11 +390,54 @@ class xFuserModel(abc.ABC):
                 batch_size=self.config.batch_size,
             )
 
+        pp_degree = getattr(
+            getattr(self.engine_config, "parallel_config", None),
+            "pp_degree",
+            1,
+        )
+        if pp_degree > 1:
+            # Create both directional P2P communicators before rank-local
+            # compilation. Otherwise a fast downstream stage can enter its
+            # first receive while stage 0 is still compiling and time out
+            # during lazy NCCL communicator setup.
+            group = get_pp_group()
+            token = torch.zeros(
+                1,
+                device=self._local_onload_device(),
+                dtype=self.engine_config.runtime_config.dtype,
+            )
+            if is_pipeline_first_stage():
+                group.pipeline_send(
+                    token,
+                    name="_xfuser_compile_prime",
+                    segment_idx=0,
+                )
+                group.pipeline_recv(
+                    idx=0,
+                    name="_xfuser_compile_prime",
+                )
+            else:
+                group.pipeline_recv(
+                    idx=0,
+                    name="_xfuser_compile_prime",
+                )
+                group.pipeline_send(
+                    token,
+                    name="_xfuser_compile_prime",
+                    segment_idx=0,
+                )
+
         # Compile and warm the original blocks before cache adapters replace or
         # patch them, keeping stateful cross-step cache logic out of traced graphs.
         # Adapters use declared forward patterns because compiled block signatures
         # are no longer introspectable.
         if self.config.use_torch_compile:
+            if self.config.pipefusion_parallel_degree > 1:
+                from xfuser.core.cache_manager.cache_manager import (
+                    get_cache_manager,
+                )
+
+                get_cache_manager().enable_module_buffers()
             log("Torch.compile enabled. Warming up torch compiler ...")
             compile_input_args = copy.deepcopy(input_args)
             compile_input_args = self._split_prompts_for_dp(compile_input_args)
@@ -459,32 +517,72 @@ class xFuserModel(abc.ABC):
             else cache_method
         )
         pp_size = get_pipeline_parallel_world_size()
-        if engine_method == "dbcache" and pp_size > 1:
-            raise ValueError(
-                f"dbcache is incompatible with PipeFusion (PP={pp_size}): "
-                "the residual-diff skip decision is computed via a collective that only runs on the "
-                "stage holding the cached block, so the world collective deadlocks. Disable dbcache "
-                "or set --pipefusion_parallel_degree 1."
-            )
         if engine_method == "dbcache" and get_data_parallel_world_size() > 1:
             raise ValueError(
                 "dbcache is incompatible with data parallelism because its cache "
                 "decision is synchronized across the world group. Set "
                 "--data_parallel_degree 1."
             )
-        if engine_method in ("teacache", "fbcache") and pp_size > 1:
+        if cache_method in ("teacache", "fbcache") and pp_size > 1:
             raise ValueError(
-                f"{engine_method} is incompatible with PipeFusion (PP={pp_size}). "
+                f"{cache_method} is incompatible with PipeFusion (PP={pp_size}). "
                 "Set --pipefusion_parallel_degree 1."
+            )
+        if (
+            engine_method == "dbcache"
+            and pp_size > 1
+            and not isinstance(method_cfg, DBCacheSettings)
+        ):
+            raise ValueError(
+                "dbcache with PipeFusion requires an explicit model-specific "
+                "DBCacheSettings declaration."
             )
         if cache_method == "teacache" and get_tensor_model_parallel_world_size() > 1:
             raise RuntimeError("teacache requires TP=1")
+        from xfuser.model_executor.cache.presets import (
+            parse_pipefusion_cache_plan_request,
+        )
+
+        requested_pipefusion_cache_unit = (
+            parse_pipefusion_cache_plan_request(self.config.cache_config)
+        )
+        if requested_pipefusion_cache_unit is not None and pp_size <= 1:
+            raise ValueError(
+                "pipefusion_cache_plan in --cache_config requires "
+                "--pipefusion_parallel_degree > 1."
+            )
+        if (
+            requested_pipefusion_cache_unit is not None
+            and not isinstance(method_cfg, DBCacheSettings)
+        ):
+            raise ValueError(
+                "pipefusion_cache_plan requires model-specific "
+                "DBCacheSettings."
+            )
+        pipefusion_cache_plan = (
+            method_cfg.resolve_pipefusion_cache_plan(
+                pp_degree=pp_size,
+                num_pipeline_patches=(
+                    self.config.num_pipeline_patch or pp_size
+                ),
+                num_inference_steps=self.config.num_inference_steps,
+                attn_layer_num_for_pp=(
+                    tuple(self.config.attn_layer_num_for_pp)
+                    if self.config.attn_layer_num_for_pp
+                    else None
+                ),
+                requested_unit=requested_pipefusion_cache_unit,
+            )
+            if isinstance(method_cfg, DBCacheSettings) and pp_size > 1
+            else None
+        )
         apply_cache(
             cache_method=engine_method,
             num_steps=self.config.num_inference_steps,
             pipe=self.pipe,
             preset_kwargs=method_cfg.preset if method_cfg else None,
             adapter_config=method_cfg.adapter if method_cfg else None,
+            pipefusion_cache_plan=pipefusion_cache_plan,
             cache_config=self.config.cache_config,
             transformer_attr=self.settings.transformer_attr_names[0],
         )
@@ -509,6 +607,14 @@ class xFuserModel(abc.ABC):
     def _validate_config(self, config: xFuserArgs) -> None:
         """ Validate if the model supports requested config """
         config._validate_gemm_quantization_flags()
+        if (
+            config.pipefusion_parallel_degree > 1
+            and config.warmup_steps < 1
+        ):
+            raise ValueError(
+                "PipeFusion requires at least one synchronous denoising step "
+                "to initialize its cross-step KV cache."
+            )
         for key in ModelCapabilities.__annotations__.keys():
             config_value = getattr(config, key, None)  # Some config options might not be set in the CLI, such as support for specific attention backends.
             if isinstance(config_value, int) and not isinstance(config_value, bool):
@@ -631,7 +737,9 @@ class xFuserModel(abc.ABC):
         # CUDA graphs are slow on RDNA4.
         return "default"  # TODO: Configurable
 
-    def _get_compile_dynamic(self) -> Optional[bool]:
+    def _get_compile_dynamic(
+        self, input_args: Optional[dict] = None
+    ) -> Optional[bool]:
         return None  # torch default (auto)
 
     def _mark_cudagraph_steps(self, component: torch.nn.Module) -> None:
@@ -658,6 +766,33 @@ class xFuserModel(abc.ABC):
 
     def _get_compiled_pipe_components(self) -> List[str]:
         return ["transformer"]
+
+    def _pipefusion_uses_block_local_cache(self) -> bool:
+        """Whether PP compilation must preserve Cache-DiT block boundaries."""
+        if (
+            self.config.pipefusion_parallel_degree <= 1
+            or self.config.cache_method not in ("dbcache", "fbcache")
+        ):
+            return False
+        method_cfg = (self.settings.step_cache_config or {}).get(
+            self.config.cache_method
+        )
+        return (
+            isinstance(method_cfg, DBCacheSettings)
+            and method_cfg.resolve_pipefusion_cache_plan(
+                pp_degree=self.config.pipefusion_parallel_degree,
+                num_pipeline_patches=(
+                    self.config.num_pipeline_patch
+                    or self.config.pipefusion_parallel_degree
+                ),
+                num_inference_steps=self.config.num_inference_steps,
+                attn_layer_num_for_pp=(
+                    tuple(self.config.attn_layer_num_for_pp)
+                    if self.config.attn_layer_num_for_pp
+                    else None
+                ),
+            ).uses_block_local_cache
+        )
 
     def _get_compile_warmup_steps(self, input_args: dict) -> Optional[int]:
         return 2  # None = skip step reduction, run full warmup cycle
@@ -688,20 +823,53 @@ class xFuserModel(abc.ABC):
     def _compile_model(self, input_args: dict) -> None:
         """Compile pipe components with torch.compile.
 
-        When FSDP is active (fully_shard_degree > 1), compiles each component's
-        FSDP-wrapped block lists individually (read from fsdp_strategy wrap_attrs)
-        to avoid dynamo tracing through FSDP2 forward_pre_hooks and fragmenting
-        the graph at every block boundary.
+        Under FSDP, compiles each component's wrapped block lists individually
+        (read from fsdp_strategy wrap_attrs) to avoid tracing through FSDP
+        hooks. PipeFusion instead compiles the already-sliced local stage as
+        one unit; its patch/KV-cache lifecycle crosses block boundaries.
         """
         self._enable_compute_comm_overlap()
 
         mode = self._get_compile_mode()
-        dynamic = self._get_compile_dynamic()
+        dynamic = self._get_compile_dynamic(input_args)
         for component_name in self._get_compiled_pipe_components():
             component = getattr(self.pipe, component_name, None)
             if component is None:
                 continue
-            if self.config.fully_shard_degree > 1 or self.config.cache_method:
+            compile_kwargs = {"mode": mode, "dynamic": dynamic}
+            requested_shards = getattr(
+                self.config,
+                "fully_shard_components",
+                None,
+            )
+            component_is_sharded = (
+                self.config.fully_shard_degree > 1
+                and component_name in self.settings.fsdp_strategy
+                and (
+                    requested_shards is None
+                    or component_name in requested_shards
+                )
+            )
+            block_local_pipefusion_cache = (
+                self._pipefusion_uses_block_local_cache()
+            )
+            if (
+                self.config.pipefusion_parallel_degree > 1
+                and not component_is_sharded
+                and not block_local_pipefusion_cache
+            ):
+                component.forward = torch.compile(
+                    component.forward,
+                    **compile_kwargs,
+                )
+            elif (
+                component_is_sharded
+                or (
+                    self.config.cache_method
+                    and self.config.pipefusion_parallel_degree == 1
+                )
+                or block_local_pipefusion_cache
+            ):
                 # Per-block compile: leaves transformer as original object so cache-dit's
                 # transformer.forward patch remains visible during compiled execution.
                 wrap_attrs = self.settings.fsdp_strategy.get(component_name, {}).get("wrap_attrs", [])
@@ -713,14 +881,24 @@ class xFuserModel(abc.ABC):
                         block_list = None
                     if block_list is not None:
                         for i in range(len(block_list)):
-                            block_list[i] = torch.compile(block_list[i], mode=mode, dynamic=dynamic)
+                            block_list[i] = torch.compile(
+                                block_list[i], **compile_kwargs
+                            )
                         compiled_any = True
                 if compiled_any and mode in self.CUDAGRAPH_COMPILE_MODES:
                     self._mark_cudagraph_steps(component)
                 if not compiled_any:
-                    setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
+                    setattr(
+                        self.pipe,
+                        component_name,
+                        torch.compile(component, **compile_kwargs),
+                    )
             else:
-                setattr(self.pipe, component_name, torch.compile(component, mode=mode, dynamic=dynamic))
+                setattr(
+                    self.pipe,
+                    component_name,
+                    torch.compile(component, **compile_kwargs),
+                )
         compile_args = copy.deepcopy(input_args)
         warmup_steps = self._get_compile_warmup_steps(input_args)
         if warmup_steps is not None:
@@ -1042,6 +1220,9 @@ class xFuserModel(abc.ABC):
         height = input_args["height"]
         width = input_args["width"]
         name = f"{self.settings.output_name}_u{ulysses_degree}r{ring_degree}_tc_{use_compile}_{height}x{width}"
+        if self.config.pipefusion_parallel_degree > 1:
+            patches = self.config.num_pipeline_patch or self.config.pipefusion_parallel_degree
+            name += f"_pp{self.config.pipefusion_parallel_degree}_patch{patches}"
         if self.config.task:
             name += f"_{self.config.task}"
         return name

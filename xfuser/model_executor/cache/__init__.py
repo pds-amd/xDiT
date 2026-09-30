@@ -9,7 +9,23 @@ from xfuser.model_executor.cache.presets import (
     CacheDitAdapterConfig,
     DBCacheSettings,
     ModelCacheConfig,
+    PipeFusionCacheDecision,
+    PipeFusionCachePlan,
+    PipeFusionCacheUnit,
+    PipeFusionStaticMask,
+    PipeFusionTopology,
 )
 from xfuser.model_executor.cache.adapters import apply_cache
 
-__all__ = ["DBCachePreset", "CacheDitAdapterConfig", "DBCacheSettings", "ModelCacheConfig", "apply_cache"]
+__all__ = [
+    "DBCachePreset",
+    "CacheDitAdapterConfig",
+    "DBCacheSettings",
+    "ModelCacheConfig",
+    "PipeFusionCacheDecision",
+    "PipeFusionCachePlan",
+    "PipeFusionCacheUnit",
+    "PipeFusionStaticMask",
+    "PipeFusionTopology",
+    "apply_cache",
+]

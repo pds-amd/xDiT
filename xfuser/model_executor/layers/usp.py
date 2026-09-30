@@ -400,7 +400,10 @@ def USP(
 
     joint_attn_kwargs = None
     if joint_strategy:
-        query = _concat_joint_tensor(query, joint_query, joint_strategy, dim=2)
+        if joint_query is not None:
+            query = _concat_joint_tensor(
+                query, joint_query, joint_strategy, dim=2
+            )
         joint_key, joint_value = _preprocess_joint_tensors(joint_key, joint_value)
         joint_attn_kwargs = {
             "joint_value": joint_value,

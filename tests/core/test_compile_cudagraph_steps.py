@@ -12,6 +12,12 @@ import pytest
 import torch
 
 from xfuser.model_executor.models.runner_models.base_model import xFuserModel
+from xfuser.core.cache_manager.cache_manager import CacheManager
+from xfuser.model_executor.cache.presets import (
+    CacheDitAdapterConfig,
+    DBCacheSettings,
+    PipeFusionCachePlan,
+)
 
 
 class _Runner(xFuserModel):
@@ -24,22 +30,47 @@ class _Runner(xFuserModel):
         raise NotImplementedError
 
 
-def _model(mode: str, *, fully_shard_degree: int):
+def _model(
+    mode: str,
+    *,
+    fully_shard_degree: int,
+    pipefusion_parallel_degree: int = 1,
+    cache_plan: PipeFusionCachePlan | None = None,
+):
     blocks = torch.nn.ModuleList([torch.nn.Linear(4, 4) for _ in range(3)])
     transformer = torch.nn.Module()
     transformer.blocks = blocks
     model = object.__new__(_Runner)
-    model.config = SimpleNamespace(fully_shard_degree=fully_shard_degree)
+    model.config = SimpleNamespace(
+        fully_shard_degree=fully_shard_degree,
+        pipefusion_parallel_degree=pipefusion_parallel_degree,
+        num_pipeline_patch=pipefusion_parallel_degree,
+        num_inference_steps=4,
+        attn_layer_num_for_pp=None,
+        cache_method="dbcache" if cache_plan is not None else None,
+    )
     model.pipe = SimpleNamespace(transformer=transformer)
     model.settings = SimpleNamespace(
-        fsdp_strategy={"transformer": {"wrap_attrs": ["blocks"]}}
+        fsdp_strategy={"transformer": {"wrap_attrs": ["blocks"]}},
+        step_cache_config=(
+            {
+                "dbcache": DBCacheSettings(
+                    adapter=CacheDitAdapterConfig(
+                        blocks=(("blocks", "Pattern_1"),),
+                    ),
+                    pipefusion_cache_plans=(cache_plan,),
+                )
+            }
+            if cache_plan is not None
+            else {}
+        ),
     )
     model._enable_compute_comm_overlap = lambda: None
     model._get_compile_mode = lambda: mode
-    model._get_compile_dynamic = lambda: False
+    model._get_compile_dynamic = lambda input_args=None: False
     model._get_compiled_pipe_components = lambda: ["transformer"]
     model._get_compile_warmup_steps = lambda input_args: None
-    model._run_timed_pipe = lambda input_args: None
+    model._run_compile_warmup = lambda input_args: None
     return model, transformer
 
 
@@ -50,6 +81,94 @@ def test_blockwise_compilation_under_cuda_graphs_marks_step_boundaries():
 
     assert transformer._xfuser_marks_cudagraph_steps
     assert len(transformer._forward_pre_hooks) == 1
+
+
+def test_pipefusion_compiles_the_stage_as_one_boundary(monkeypatch):
+    model, transformer = _model(
+        "default",
+        fully_shard_degree=1,
+        pipefusion_parallel_degree=2,
+    )
+    compiled = []
+
+    def compile_component(component, **kwargs):
+        compiled.append(component)
+        return component
+
+    monkeypatch.setattr(torch, "compile", compile_component)
+    model._compile_model({"num_inference_steps": 4})
+
+    assert len(compiled) == 1
+    assert compiled[0].__self__ is transformer
+
+
+def test_pipefusion_with_fsdp_compiles_local_blocks(monkeypatch):
+    model, transformer = _model(
+        "default",
+        fully_shard_degree=2,
+        pipefusion_parallel_degree=2,
+    )
+    compiled = []
+
+    def compile_component(component, **kwargs):
+        compiled.append(component)
+        return component
+
+    monkeypatch.setattr(torch, "compile", compile_component)
+    model._compile_model({"num_inference_steps": 4})
+
+    assert compiled == list(transformer.blocks)
+
+
+@pytest.mark.parametrize(
+    ("cache_plan", "expected_block_compilation"),
+    [
+        (PipeFusionCachePlan.block_local(), True),
+        (PipeFusionCachePlan.full_stage_output(), False),
+    ],
+)
+def test_pipefusion_compilation_matches_cache_scope(
+    monkeypatch,
+    cache_plan,
+    expected_block_compilation,
+):
+    model, transformer = _model(
+        "default",
+        fully_shard_degree=1,
+        pipefusion_parallel_degree=2,
+        cache_plan=cache_plan,
+    )
+    compiled = []
+
+    def compile_component(component, **kwargs):
+        compiled.append(component)
+        return component
+
+    monkeypatch.setattr(torch, "compile", compile_component)
+    model._compile_model({"num_inference_steps": 4})
+
+    if expected_block_compilation:
+        assert compiled == list(transformer.blocks)
+    else:
+        assert len(compiled) == 1
+        assert compiled[0].__self__ is transformer
+
+
+def test_kv_cache_uses_module_buffer_for_compiled_layers():
+    manager = CacheManager()
+    layer = torch.nn.Linear(4, 4)
+    manager.register_cache_entry(
+        layer,
+        "attn",
+        "naive_cache",
+        use_module_buffer=True,
+    )
+    key_value = torch.randn(1, 3, 8)
+
+    result = manager.update_and_get_kv_cache(key_value, layer)
+
+    assert result is key_value
+    assert layer._xdit_kv_cache is key_value
 
 
 def test_the_marker_actually_announces_the_step_to_torch(monkeypatch):
